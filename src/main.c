@@ -1,5 +1,10 @@
 #include "datatypes.h"
 #include "simcore.h"
+#ifdef _WIN32
+#include <windows.h>
+#else
+#include <unistd.h>
+#endif
 
 int main(int argc, char *argv[]) {
     int item_count = 30;
@@ -23,7 +28,8 @@ int main(int argc, char *argv[]) {
             printf("示例:\n");
             printf("  warehouse_sim 50 123         终端模式, 50货物, 种子123\n");
             printf("  warehouse_sim -s -p 9000     服务器模式, 端口9000\n");
-            system("pause");
+            printf("\n按回车键退出...");
+            getchar();
             return 0;
         } else if (argv[i][0] != '-') {
             /* 位置参数 */
@@ -68,6 +74,7 @@ int main(int argc, char *argv[]) {
     }
 
     printf("\n仿真结束\n");
-    system("pause");
+    printf("按回车键退出...");
+    getchar();
     return 0;
 }

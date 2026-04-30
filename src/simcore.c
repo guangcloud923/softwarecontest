@@ -11,6 +11,8 @@
 #include "pathfinding.h"
 #ifdef _WIN32
 #include <windows.h>
+#else
+#include <unistd.h>
 #endif
 
 /* 简单的LCG随机数 */
@@ -54,7 +56,7 @@ void sim_init(SimState *s, int item_count, int seed) {
         s->tzones[i].pos = tz_pos[i];
         s->tzones[i].item_cnt = 0;
         s->tzones[i].total_vol = 0.0;
-        s->tzones[i].capacity_vol = 1.0;
+        s->tzones[i].capacity_vol = 2.0;
         s->tzones[i].robot_id = (i < 2) ? 0 : 1;
         s->tzones[i].shelf_ids[0] = i;
         s->tzones[i].shelf_ids[1] = -1;

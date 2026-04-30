@@ -1,7 +1,8 @@
 CC = gcc
 CFLAGS = -Wall -Wextra -O2 -std=c99
-LDFLAGS = -lws2_32 -lm
+LDFLAGS = -lm
 
+SRCDIR = src
 SRC = main.c simcore.c map.c pathfinding.c scheduler.c \
       agv.c conveyor.c robot.c defrag.c constraint.c stats.c server.c
 OBJ = $(SRC:.c=.o)
@@ -14,7 +15,7 @@ all: $(TARGET)
 $(TARGET): $(OBJ)
 	$(CC) $(OBJ) -o $(TARGET) $(LDFLAGS)
 
-%.o: %.c
+%.o: $(SRCDIR)/%.c
 	$(CC) $(CFLAGS) -c $< -o $@
 
 run: $(TARGET)

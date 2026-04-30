@@ -1,12 +1,18 @@
 # 编译产物
 *.o
 *.exe
+warehouse_sim
 
 # IDE
 .vscode/
+.idea/
 
 # Claude
 .claude/
 
 # 调试临时文件
 *.debug*
+
+# 系统文件
+.DS_Store
+Thumbs.db

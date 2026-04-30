@@ -11,6 +11,7 @@
   #include <netinet/in.h>
   #include <arpa/inet.h>
   #include <unistd.h>
+  #include <fcntl.h>
   typedef int socket_t;
   #define SOCK_INVALID (-1)
   #define closesocket close
