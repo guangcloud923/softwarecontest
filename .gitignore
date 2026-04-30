@@ -1,0 +1,12 @@
+# 编译产物
+*.o
+*.exe
+
+# IDE
+.vscode/
+
+# Claude
+.claude/
+
+# 调试临时文件
+*.debug*
