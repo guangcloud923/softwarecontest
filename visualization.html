@@ -1,0 +1,378 @@
+<!DOCTYPE html>
+<html lang="zh-CN">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1.0">
+<title>智能仓储仿真可视化</title>
+<style>
+* { margin: 0; padding: 0; box-sizing: border-box; }
+body { background: #1a1a2e; color: #e0e0e0; font-family: 'Consolas', 'Courier New', monospace; display: flex; height: 100vh; overflow: hidden; }
+#main { display: flex; flex: 1; padding: 16px; gap: 16px; }
+
+#grid-panel { flex: 1; display: flex; flex-direction: column; align-items: center; }
+#grid-panel h2 { color: #00d4ff; margin-bottom: 8px; font-size: 18px; letter-spacing: 2px; }
+#grid-container { position: relative; border: 2px solid #333; border-radius: 4px; overflow: hidden; }
+canvas { display: block; }
+
+#side-panel { width: 340px; display: flex; flex-direction: column; gap: 12px; }
+.panel-box { background: #16213e; border: 1px solid #0f3460; border-radius: 6px; padding: 14px; }
+.panel-box h3 { color: #e94560; font-size: 13px; margin-bottom: 8px; text-transform: uppercase; letter-spacing: 1px; }
+.stat-row { display: flex; justify-content: space-between; padding: 3px 0; font-size: 13px; }
+.stat-row .label { color: #888; }
+.stat-row .value { color: #00d4ff; font-weight: bold; }
+.bar-wrap { background: #0f3460; height: 6px; border-radius: 3px; margin: 6px 0; overflow: hidden; }
+.bar-fill { height: 100%; background: linear-gradient(90deg, #00d4ff, #e94560); border-radius: 3px; transition: width 0.3s; }
+
+#event-log { max-height: 160px; overflow-y: auto; font-size: 11px; }
+#event-log .ev { padding: 2px 0; border-bottom: 1px solid #1a1a2e; color: #aaa; }
+#event-log .ev .t { color: #666; margin-right: 6px; }
+
+#legend { display: flex; flex-wrap: wrap; gap: 8px; font-size: 11px; }
+#legend span { display: flex; align-items: center; gap: 4px; }
+#legend .swatch { width: 12px; height: 12px; border-radius: 2px; }
+
+#status-bar { display: flex; justify-content: space-between; align-items: center; padding: 8px 16px; background: #0f3460; font-size: 12px; }
+#status-bar .dot { width: 8px; height: 8px; border-radius: 50%; display: inline-block; margin-right: 6px; }
+.dot.green { background: #0f0; }
+.dot.red { background: #f00; }
+
+#connect-form { display: flex; gap: 8px; align-items: center; }
+#connect-form input { background: #1a1a2e; border: 1px solid #333; color: #e0e0e0; padding: 4px 8px; border-radius: 3px; width: 200px; font-family: inherit; font-size: 12px; }
+#connect-form button { background: #e94560; color: #fff; border: none; padding: 4px 12px; border-radius: 3px; cursor: pointer; font-family: inherit; font-size: 12px; }
+#connect-form button:hover { background: #ff6b81; }
+</style>
+</head>
+<body>
+
+<div id="status-bar">
+  <div>
+    <span id="conn-dot" class="dot red"></span>
+    <span id="conn-text">未连接</span>
+    <span style="margin-left:20px">帧: <b id="frame-id">-</b></span>
+    <span style="margin-left:12px">T: <b id="sim-time">0</b></span>
+  </div>
+  <div id="connect-form">
+    <input id="ws-url" value="ws://localhost:8080/ws" placeholder="WebSocket URL">
+    <button id="btn-connect" onclick="doConnect()">连接</button>
+  </div>
+</div>
+
+<div id="main">
+  <div id="grid-panel">
+    <h2>WAREHOUSE SIMULATION</h2>
+    <div id="grid-container">
+      <canvas id="grid-canvas"></canvas>
+    </div>
+    <div id="legend" style="margin-top:10px">
+      <span><div class="swatch" style="background:#333"></div> 道路</span>
+      <span><div class="swatch" style="background:#ff9800"></div> 传送带末端</span>
+      <span><div class="swatch" style="background:#4caf50"></div> 缓冲区</span>
+      <span><div class="swatch" style="background:#9c27b0"></div> 路口</span>
+      <span><div class="swatch" style="background:#2196f3"></div> 交接区</span>
+      <span><div class="swatch" style="background:#ff5722"></div> 货架</span>
+      <span><div class="swatch" style="background:#607d8b"></div> 停车区</span>
+      <span><div class="swatch" style="background:#00d4ff;border-radius:50%"></div> AGV</span>
+    </div>
+  </div>
+
+  <div id="side-panel">
+    <div class="panel-box">
+      <h3>仿真统计</h3>
+      <div class="stat-row"><span class="label">难度系数</span><span class="value" id="st-diff">-</span></div>
+      <div class="stat-row"><span class="label">已上架 / 总数</span><span class="value" id="st-shelved">-</span></div>
+      <div class="stat-row"><span class="label">上架率</span><span class="value" id="st-rate">-</span></div>
+      <div class="bar-wrap"><div class="bar-fill" id="st-bar" style="width:0%"></div></div>
+      <div class="stat-row"><span class="label">当前得分</span><span class="value" id="st-score">-</span></div>
+      <div class="stat-row"><span class="label">约束违规</span><span class="value" id="st-violations">0</span></div>
+      <div class="stat-row"><span class="label">碰撞</span><span class="value" id="st-collision">-</span></div>
+    </div>
+
+    <div class="panel-box">
+      <h3>AGV 状态</h3>
+      <div id="agv-status"></div>
+    </div>
+
+    <div class="panel-box">
+      <h3>缓冲区 / 交接区</h3>
+      <div id="buf-tz-status"></div>
+    </div>
+
+    <div class="panel-box">
+      <h3>事件日志</h3>
+      <div id="event-log"></div>
+    </div>
+  </div>
+</div>
+
+<script>
+const CELL_COLORS = {
+  0: '#222',       // EMPTY (road is drawn separately)
+  1: '#111',       // OBSTACLE
+  2: '#ff9800',    // CONVEYOR_END
+  3: '#4caf50',    // BUFFER
+  4: '#9c27b0',    // CROSSROAD
+  5: '#2196f3',    // TRANSFER
+  6: '#ff5722',    // SHELF
+  7: '#607d8b',    // PARK
+  8: '#555'        // NARROW
+};
+
+const CELL_LABELS = {
+  2: 'C', 3: 'B', 4: 'J', 5: 'T', 6: 'S', 7: 'P'
+};
+
+const AGV_COLORS = ['#00d4ff', '#ffeb3b', '#ff6b81', '#69f0ae'];
+
+let ws = null;
+let gridData = null;
+let frameData = null;
+let canvas, ctx;
+const CELL_SZ = 42;
+const GRID_W = 16, GRID_H = 14;
+
+function initCanvas() {
+  canvas = document.getElementById('grid-canvas');
+  canvas.width = GRID_W * CELL_SZ;
+  canvas.height = GRID_H * CELL_SZ;
+  ctx = canvas.getContext('2d');
+  drawEmptyGrid();
+}
+
+function drawEmptyGrid() {
+  ctx.fillStyle = '#111';
+  ctx.fillRect(0, 0, canvas.width, canvas.height);
+
+  // Draw road grid lines
+  const vroads = [1,3,5,7,10,12,14];
+  const hroads = [0,2,4,6,8,10];
+  vroads.forEach(x => {
+    hroads.forEach(y => {
+      ctx.fillStyle = '#2a2a3a';
+      ctx.fillRect(x * CELL_SZ, y * CELL_SZ, CELL_SZ, CELL_SZ);
+    });
+  });
+  // Fill vertical connections
+  vroads.forEach(x => {
+    for (let y = 0; y < GRID_H; y++) {
+      if (hroads.includes(y)) continue;
+      ctx.fillStyle = '#2a2a3a';
+      ctx.fillRect(x * CELL_SZ, y * CELL_SZ, CELL_SZ, CELL_SZ);
+    }
+  });
+
+  // Grid lines
+  ctx.strokeStyle = '#1a1a2e';
+  ctx.lineWidth = 1;
+  for (let x = 0; x <= GRID_W; x++) {
+    ctx.beginPath();
+    ctx.moveTo(x * CELL_SZ, 0);
+    ctx.lineTo(x * CELL_SZ, GRID_H * CELL_SZ);
+    ctx.stroke();
+  }
+  for (let y = 0; y <= GRID_H; y++) {
+    ctx.beginPath();
+    ctx.moveTo(0, y * CELL_SZ);
+    ctx.lineTo(GRID_W * CELL_SZ, y * CELL_SZ);
+    ctx.stroke();
+  }
+}
+
+function drawGrid() {
+  if (!gridData) return;
+  drawEmptyGrid();
+
+  for (let y = 0; y < GRID_H; y++) {
+    for (let x = 0; x < GRID_W; x++) {
+      const type = gridData[y][x];
+      if (type === 0 || type === 1) continue; // road/obstacle already drawn
+      const cx = x * CELL_SZ, cy = y * CELL_SZ;
+      ctx.fillStyle = CELL_COLORS[type] || '#333';
+      ctx.fillRect(cx + 2, cy + 2, CELL_SZ - 4, CELL_SZ - 4);
+      if (CELL_LABELS[type]) {
+        ctx.fillStyle = '#fff';
+        ctx.font = 'bold 14px Consolas';
+        ctx.textAlign = 'center';
+        ctx.textBaseline = 'middle';
+        ctx.fillText(CELL_LABELS[type], cx + CELL_SZ/2, cy + CELL_SZ/2);
+      }
+    }
+  }
+}
+
+function drawFrame() {
+  if (!gridData) return;
+  drawGrid();
+
+  if (!frameData) return;
+  const d = frameData;
+
+  // Draw AGVs
+  if (d.agvs) {
+    d.agvs.forEach((agv, i) => {
+      const [ax, ay] = agv.pos;
+      const cx = ax * CELL_SZ + CELL_SZ/2;
+      const cy = ay * CELL_SZ + CELL_SZ/2;
+      const r = CELL_SZ/2 - 4;
+
+      // Glow
+      ctx.beginPath();
+      ctx.arc(cx, cy, r + 2, 0, Math.PI * 2);
+      ctx.fillStyle = AGV_COLORS[i] + '44';
+      ctx.fill();
+
+      // Body
+      ctx.beginPath();
+      ctx.arc(cx, cy, r, 0, Math.PI * 2);
+      ctx.fillStyle = AGV_COLORS[i];
+      ctx.fill();
+      ctx.strokeStyle = '#fff';
+      ctx.lineWidth = 2;
+      ctx.stroke();
+
+      // Label
+      ctx.fillStyle = '#000';
+      ctx.font = 'bold 10px Consolas';
+      ctx.textAlign = 'center';
+      ctx.textBaseline = 'middle';
+      ctx.fillText('A' + i, cx, cy);
+
+      // Load indicator
+      if (agv.load > 0) {
+        ctx.fillStyle = '#fff';
+        ctx.font = '8px Consolas';
+        ctx.fillText(agv.load.toFixed(1), cx, cy + r + 10);
+      }
+    });
+  }
+
+  // Draw item counts on buffers
+  const bufPos = [[3,2],[12,2]];
+  if (d.buffers) {
+    bufPos.forEach(([bx, by], i) => {
+      const key = 'buffer_' + i;
+      const cnt = d.buffers[key] ? d.buffers[key].length : 0;
+      if (cnt > 0) {
+        const cx = bx * CELL_SZ + CELL_SZ/2;
+        const cy = by * CELL_SZ + CELL_SZ - 10;
+        ctx.fillStyle = '#fff';
+        ctx.font = 'bold 11px Consolas';
+        ctx.textAlign = 'center';
+        ctx.fillText(cnt + '件', cx, cy);
+      }
+    });
+  }
+
+  // Draw transfer zone volumes
+  const tzPos = [[1,8],[5,8],[10,8],[14,8]];
+  if (d.transfers) {
+    d.transfers.forEach((tz, i) => {
+      if (i < 4) {
+        const [tx, ty] = tzPos[i];
+        const cx = tx * CELL_SZ + CELL_SZ/2;
+        const cy = ty * CELL_SZ + CELL_SZ - 10;
+        ctx.fillStyle = '#fff';
+        ctx.font = 'bold 10px Consolas';
+        ctx.textAlign = 'center';
+        ctx.fillText(tz.vol.toFixed(1) + 'm³', cx, cy);
+      }
+    });
+  }
+}
+
+function updateStats() {
+  if (!frameData) return;
+  const d = frameData;
+  document.getElementById('frame-id').textContent = d.frame_id;
+  document.getElementById('sim-time').textContent = d.time;
+  document.getElementById('st-diff').textContent = d.difficulty?.toFixed(1) || '-';
+  document.getElementById('st-score').textContent = d.t_score?.toFixed(1) || '-';
+
+  const stats = d.stats || {};
+  document.getElementById('st-shelved').textContent = `${stats.shelved || 0} / ${stats.total || 0}`;
+  const rate = stats.total > 0 ? (stats.shelved / stats.total * 100).toFixed(1) : 0;
+  document.getElementById('st-rate').textContent = rate + '%';
+  document.getElementById('st-bar').style.width = rate + '%';
+  document.getElementById('st-violations').textContent = stats.violations || 0;
+  document.getElementById('st-collision').textContent = stats.collision ? '⚠ 发生碰撞!' : '✓ 无';
+
+  // AGV status
+  let agvHtml = '';
+  if (d.agvs) {
+    d.agvs.forEach((agv, i) => {
+      agvHtml += `<div class="stat-row" style="color:${AGV_COLORS[i]}">
+        <span>AGV_${i} (${agv.pos[0]},${agv.pos[1]})</span>
+        <span>${agv.status} | ${agv.load.toFixed(2)}m³ | ${agv.items?.length || 0}件</span>
+      </div>`;
+    });
+  }
+  document.getElementById('agv-status').innerHTML = agvHtml || '<div class="stat-row"><span class="label">无数据</span></div>';
+
+  // Buffer & Transfer zone status
+  let btHtml = '';
+  if (d.buffers) {
+    for (let i = 0; i < 2; i++) {
+      const key = 'buffer_' + i;
+      const cnt = d.buffers[key] ? d.buffers[key].length : 0;
+      btHtml += `<div class="stat-row"><span class="label">缓冲区 B${i+1}</span><span class="value">${cnt} / 6 件</span></div>`;
+    }
+  }
+  if (d.transfers) {
+    d.transfers.forEach((tz, i) => {
+      btHtml += `<div class="stat-row"><span class="label">交接区 T${i+1}</span><span class="value">${tz.items || 0}件 | ${tz.vol.toFixed(2)}m³</span></div>`;
+    });
+  }
+  document.getElementById('buf-tz-status').innerHTML = btHtml || '<div class="stat-row"><span class="label">无数据</span></div>';
+
+  // Events
+  if (d.events && d.events.length > 0) {
+    let evHtml = '';
+    d.events.forEach(e => {
+      evHtml += `<div class="ev"><span class="t">T${Math.floor(d.time)}</span>${e}</div>`;
+    });
+    document.getElementById('event-log').innerHTML = evHtml;
+  }
+
+  // Running state
+  if (d.running === false) {
+    document.getElementById('conn-text').textContent = '仿真已结束';
+  }
+}
+
+function processFrame(json) {
+  const d = JSON.parse(json);
+  if (d.grid) { gridData = d.grid; }
+  frameData = d;
+  drawFrame();
+  updateStats();
+}
+
+function doConnect() {
+  const url = document.getElementById('ws-url').value;
+  if (ws) { ws.close(); }
+
+  ws = new WebSocket(url);
+  ws.onopen = () => {
+    document.getElementById('conn-dot').className = 'dot green';
+    document.getElementById('conn-text').textContent = '已连接';
+    document.getElementById('btn-connect').textContent = '断开';
+    document.getElementById('btn-connect').onclick = () => { ws.close(); };
+  };
+  ws.onclose = () => {
+    document.getElementById('conn-dot').className = 'dot red';
+    document.getElementById('conn-text').textContent = '已断开';
+    document.getElementById('btn-connect').textContent = '连接';
+    document.getElementById('btn-connect').onclick = doConnect;
+  };
+  ws.onerror = () => {
+    document.getElementById('conn-text').textContent = '连接失败';
+  };
+  ws.onmessage = (e) => {
+    processFrame(e.data);
+  };
+}
+
+initCanvas();
+doConnect();
+</script>
+</body>
+</html>

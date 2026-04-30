@@ -1,69 +1,67 @@
 #include "conveyor.h"
 
 void conveyor_init(SimState *s) {
+    s->conveyor_cnt = MAX_CONVEYORS;
+
+    /* C1 在 (3,0), C2 在 (12,0) */
+    Pos2D ends[] = {{3, 0}, {12, 0}};
     int i;
-    s->conveyor_cnt = 2;
 
     for (i = 0; i < s->conveyor_cnt; i++) {
-        s->conveyors[i].id = i;
-        s->conveyors[i].cargo_cnt = 0;
-        s->conveyors[i].capacity = 10;
-        s->conveyors[i].paused = 0;
-        s->conveyors[i].output_buffer_id = i;       /* C1->B1, C2->B2 */
-        s->conveyors[i].node_id = (i == 0) ? 0 : 1; /* C1->node0, C2->node1 */
-        s->conveyors[i].spawn_timer = 0;
-        s->conveyors[i].spawn_interval = 3;          /* 每3 tick生成一个货物 */
+        Conveyor *c = &s->conveyors[i];
+        c->id = i;
+        c->end_pos = ends[i];
+        c->output_buffer_id = i;
+        c->item_cnt = 0;
+        c->paused = 0;
+        c->spawn_timer = 0;
+        c->spawn_interval = 2;  /* 每2 tick出一个货 */
     }
 }
 
-/* 传送带步骤: 生成新货物 + 推向缓冲区 */
 void conveyor_step(SimState *s, int id) {
     Conveyor *c = &s->conveyors[id];
+    Buffer *b = &s->buffers[c->output_buffer_id];
 
     if (c->paused) return;
 
+    /* 生成新货物 */
     c->spawn_timer++;
     if (c->spawn_timer >= c->spawn_interval) {
         c->spawn_timer = 0;
-        /* 找空闲cargo槽位(只挑属于本传送带分支的货物) */
-        int ci;
-        for (ci = 0; ci < MAX_CARGOS; ci++) {
-            if (s->cargos[ci].state == CS_INIT && s->cargos[ci].id >= 0) {
-                int tgt = s->cargos[ci].target_shelf_id;
-                int correct = (tgt == 0 || tgt == 2) ? 0 : 1;
-                if (correct == id) break;
+
+        /* 查找待生成的货物 (状态=INIT, 属于本传送带分支) */
+        int i, found = -1;
+        for (i = 0; i < s->item_cnt; i++) {
+            if (s->items[i].state != ITEM_INIT) continue;
+            int tgt = s->items[i].target_shelf;
+            /* 传送带0处理货架0,2; 传送带1处理货架1,3 */
+            int belt = (tgt == 0 || tgt == 2) ? 0 : 1;
+            if (belt == id) { found = i; break; }
+        }
+
+        if (found >= 0) {
+            /* 传送带满则不下发, 等下一轮 */
+            if (c->item_cnt >= 10) {
+                c->spawn_timer = c->spawn_interval - 1;
+            } else {
+                s->items[found].state = ITEM_ON_CONVEYOR;
+                s->items[found].location_id = id;
+                s->items[found].t_spawn = s->time;
+                c->items[c->item_cnt++] = found;
             }
         }
-        if (ci >= MAX_CARGOS) return; /* 无空闲货物 */
-
-        /* 限制传送带货物数量 */
-        if (c->cargo_cnt >= c->capacity) {
-            c->paused = 1;
-            return;
-        }
-
-        /* 将货物放到传送带 */
-        s->cargos[ci].state = CS_ON_CONVEYOR;
-        s->cargos[ci].location_id = id;
-        c->cargo_ids[c->cargo_cnt++] = ci;
     }
 
-    /* 尝试推向缓冲区 */
-    Buffer *b = &s->buffers[c->output_buffer_id];
-    while (c->cargo_cnt > 0 && b->cargo_cnt < b->capacity) {
-        int ci = c->cargo_ids[0];
-        /* 从传送带移除 */
-        memmove(&c->cargo_ids[0], &c->cargo_ids[1],
-                (c->cargo_cnt - 1) * sizeof(int));
-        c->cargo_cnt--;
+    /* 推向缓冲区 (硬限制: 6, 防止capacity被意外改写) */
+    while (c->item_cnt > 0 && b->item_cnt < 6) {
+        int item_id = c->items[0];
+        memmove(&c->items[0], &c->items[1],
+                (c->item_cnt - 1) * sizeof(int));
+        c->item_cnt--;
 
-        /* 放入缓冲区 */
-        s->cargos[ci].state = CS_IN_BUFFER;
-        s->cargos[ci].location_id = b->id;
-        b->cargo_ids[b->cargo_cnt++] = ci;
-
-        if (c->paused && c->cargo_cnt < c->capacity) {
-            c->paused = 0;
-        }
+        s->items[item_id].state = ITEM_IN_BUFFER;
+        s->items[item_id].location_id = b->id;
+        b->items[b->item_cnt++] = item_id;
     }
 }

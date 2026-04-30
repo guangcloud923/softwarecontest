@@ -1,45 +1,45 @@
 #include "robot.h"
 
 void robot_init(SimState *s) {
-    int i;
     s->robot_cnt = MAX_ROBOTS;
+    int i;
 
     for (i = 0; i < s->robot_cnt; i++) {
-        s->robots[i].id = i;
-        s->robots[i].state = ROBOT_IDLE;
-        s->robots[i].tp_id = i;
-        s->robots[i].shelf_cnt = 2;
-        s->robots[i].shelf_ids[0] = i;
-        s->robots[i].shelf_ids[1] = i + 2;
-        s->robots[i].cargo_cnt = 0;
-        s->robots[i].load_vol = 0.0;
-        s->robots[i].wait_ticks = 0;
-        s->robots[i].busy = 0;
+        ShelfRobot *r = &s->robots[i];
+        r->id = i;
+        r->status = ROBOT_IDLE;
+        if (i == 0) {
+            r->shelf_ids[0] = 0; r->shelf_ids[1] = 1;
+            r->tp_id = 0;
+        } else {
+            r->shelf_ids[0] = 2; r->shelf_ids[1] = 3;
+            r->tp_id = 2;
+        }
+        r->item_cnt = 0;
+        r->load_vol = 0.0;
+        r->wait_ticks = 0;
+        r->busy = 0;
     }
 }
 
-/* 查找TP中匹配+同体积+不超容的货物, 返回下标, -1表示无 */
-static int find_suitable_cargo(SimState *s, ShelfRobot *r, TransferPoint *tp) {
+static int find_suitable_item(SimState *s, ShelfRobot *r, TransferZone *tz) {
     int i, j;
-    for (i = 0; i < tp->cargo_cnt; i++) {
-        int ci = tp->cargo_ids[i];
-        int target = s->cargos[ci].target_shelf_id;
+    for (i = 0; i < tz->item_cnt; i++) {
+        int item_id = tz->items[i];
+        Item *it = &s->items[item_id];
 
-        /* 货架是否归本机器人管 */
-        int matched_shelf = 0;
-        for (j = 0; j < r->shelf_cnt; j++) {
-            if (r->shelf_ids[j] == target) { matched_shelf = 1; break; }
+        int ok = 0;
+        for (j = 0; j < 2; j++) {
+            if (r->shelf_ids[j] == it->target_shelf) { ok = 1; break; }
         }
-        if (!matched_shelf) continue;
+        if (!ok) continue;
 
-        /* 体积一致性: 已有货物时只能取同体积 */
-        if (r->cargo_cnt > 0) {
-            int first_ci = r->cargo_ids[0];
-            if (s->cargos[first_ci].volume != s->cargos[ci].volume) continue;
+        if (r->item_cnt > 0) {
+            Item *first = &s->items[r->items[0]];
+            if (first->volume != it->volume) continue;
         }
 
-        /* 不超容 */
-        double vol = VOL_VAL[s->cargos[ci].volume];
+        double vol = VOL_VAL[it->volume];
         if (r->load_vol + vol > 1.001) continue;
 
         return i;
@@ -47,124 +47,139 @@ static int find_suitable_cargo(SimState *s, ShelfRobot *r, TransferPoint *tp) {
     return -1;
 }
 
+static void try_other_tzone(SimState *s, ShelfRobot *r) {
+    int tz_ids[2][2] = {{0, 1}, {2, 3}};
+    int current = r->tp_id;
+    int other = (current == tz_ids[r->id][0]) ? tz_ids[r->id][1] : tz_ids[r->id][0];
+
+    if (s->tzones[other].item_cnt > 0) {
+        if (find_suitable_item(s, r, &s->tzones[other]) >= 0) {
+            r->tp_id = other;
+        }
+    }
+}
+
 void robot_step(SimState *s, int id) {
     ShelfRobot *r = &s->robots[id];
-    TransferPoint *tp = &s->tps[r->tp_id];
+    TransferZone *tz = &s->tzones[r->tp_id];
 
-    if (r->state == ROBOT_IDLE) {
-        if (tp->cargo_cnt == 0) return;
+    switch (r->status) {
+    case ROBOT_IDLE: {
+        int tz_ids[2][2] = {{0, 1}, {2, 3}};
+        int found = 0;
+        int ti;
 
-        if (find_suitable_cargo(s, r, tp) >= 0) {
-            r->state = ROBOT_FETCHING;
-            r->wait_ticks = 1;
+        for (ti = 0; ti < 2; ti++) {
+            int tid = tz_ids[r->id][ti];
+            if (s->tzones[tid].item_cnt > 0 &&
+                find_suitable_item(s, r, &s->tzones[tid]) >= 0) {
+                r->tp_id = tid;
+                tz = &s->tzones[tid];
+                found = 1;
+                break;
+            }
         }
-        return;
+
+        if (!found) break;
+
+        r->status = ROBOT_FETCHING;
+        r->wait_ticks = 1;
+        r->busy = 1;
+        break;
     }
 
-    if (r->state == ROBOT_FETCHING) {
+    case ROBOT_FETCHING:
         r->wait_ticks--;
-        if (r->wait_ticks > 0) return;
+        if (r->wait_ticks > 0) break;
 
-        if (tp->cargo_cnt == 0) {
-            /* TP空了但手上有货 → 去上架 */
-            if (r->cargo_cnt > 0) {
-                r->state = ROBOT_SHELVING;
-                r->wait_ticks = 2;
-            } else {
-                r->state = ROBOT_IDLE;
-            }
-            return;
-        }
-
-        int found = find_suitable_cargo(s, r, tp);
-        if (found < 0) {
-            /* 没有合适的 → 手上有货就去上架, 否则空闲 */
-            if (r->cargo_cnt > 0) {
-                r->state = ROBOT_SHELVING;
-                r->wait_ticks = 2;
-            } else {
-                r->state = ROBOT_IDLE;
-            }
-            return;
-        }
-
-        int ci = tp->cargo_ids[found];
-        Cargo *cg = &s->cargos[ci];
-        double vol = VOL_VAL[cg->volume];
-
-        /* 从TP取走货物 */
-        memmove(&tp->cargo_ids[found], &tp->cargo_ids[found + 1],
-                (tp->cargo_cnt - found - 1) * sizeof(int));
-        tp->cargo_cnt--;
-
-        r->cargo_ids[r->cargo_cnt++] = ci;
-        r->load_vol += vol;
-        cg->state = CS_AT_TRANSFER;
-        cg->location_id = 100 + id;
-
-        /* 还能再取? */
-        if (r->load_vol < 0.99 && tp->cargo_cnt > 0 &&
-            find_suitable_cargo(s, r, tp) >= 0) {
-            r->wait_ticks = 1;
-            /* 继续FETCHING */
-        } else {
-            r->state = ROBOT_SHELVING;
-            r->wait_ticks = 2;
-        }
-        return;
-    }
-
-    if (r->state == ROBOT_SHELVING) {
-        r->wait_ticks--;
-        if (r->wait_ticks > 0) return;
-
-        while (r->cargo_cnt > 0) {
-            int ci = r->cargo_ids[0];
-            Cargo *cg = &s->cargos[ci];
-            int shelf_id = cg->target_shelf_id;
-
-            Shelf *sh = &s->shelves[shelf_id];
-            int slot_idx = -1;
-            int si;
-            for (si = 0; si < sh->slot_cnt; si++) {
-                if (!sh->slots[si].occupied) {
-                    slot_idx = si;
+        {
+            int pos = find_suitable_item(s, r, tz);
+            if (pos < 0) {
+                try_other_tzone(s, r);
+                tz = &s->tzones[r->tp_id];
+                pos = find_suitable_item(s, r, tz);
+                if (pos < 0) {
+                    if (r->item_cnt > 0) {
+                        r->status = ROBOT_SHELVING;
+                        r->wait_ticks = 1;
+                    } else {
+                        r->status = ROBOT_IDLE;
+                        r->busy = 0;
+                    }
                     break;
                 }
             }
 
-            if (slot_idx < 0) {
-                s->violations++;
-                snprintf(s->violation_msg, sizeof(s->violation_msg),
-                         "Shelf%d full! Cannot shelve cargo%d", shelf_id, ci);
-                /* 强制标记已上架以维护状态一致性, 防止约束检查级联误报 */
-                cg->state = CS_ON_SHELF;
-                cg->location_id = shelf_id;
-                cg->t_shelved = s->time;
-                s->cargo_shelved++;
-                memmove(&r->cargo_ids[0], &r->cargo_ids[1],
-                        (r->cargo_cnt - 1) * sizeof(int));
-                r->cargo_cnt--;
-                r->load_vol -= VOL_VAL[cg->volume];
-                continue;
+            int item_id = tz->items[pos];
+            Item *it = &s->items[item_id];
+            double vol = VOL_VAL[it->volume];
+
+            memmove(&tz->items[pos], &tz->items[pos + 1],
+                    (tz->item_cnt - pos - 1) * sizeof(int));
+            tz->item_cnt--;
+            tz->total_vol -= vol;
+
+            r->items[r->item_cnt++] = item_id;
+            r->load_vol += vol;
+            it->state = ITEM_AT_TRANSFER;
+            it->location_id = 100 + r->id;
+
+            if (r->load_vol < 0.99 &&
+                find_suitable_item(s, r, tz) >= 0) {
+                r->wait_ticks = 1;
+            } else {
+                r->status = ROBOT_SHELVING;
+                r->wait_ticks = 1;
+            }
+        }
+        break;
+
+    case ROBOT_SHELVING:
+        r->wait_ticks--;
+        if (r->wait_ticks > 0) break;
+
+        while (r->item_cnt > 0) {
+            int item_id = r->items[0];
+            Item *it = &s->items[item_id];
+            int shelf_id = it->target_shelf;
+            Shelf *sh = &s->shelves[shelf_id];
+
+            int row, col, dep;
+            int placed = 0;
+            for (row = 0; row < MAX_SHELF_ROWS && !placed; row++) {
+                for (col = 0; col < MAX_SHELF_COLS && !placed; col++) {
+                    for (dep = 0; dep < MAX_SHELF_DEPTH && !placed; dep++) {
+                        if (!sh->slots[row][col][dep].occupied) {
+                            sh->slots[row][col][dep].occupied = 1;
+                            sh->slots[row][col][dep].item_id = item_id;
+                            sh->slots[row][col][dep].vol = it->volume;
+                            sh->slots[row][col][dep].t_occupied = s->time;
+                            placed = 1;
+                        }
+                    }
+                }
             }
 
-            sh->slots[slot_idx].occupied = 1;
-            sh->slots[slot_idx].cargo_id = ci;
-            sh->slots[slot_idx].volume = cg->volume;
-            sh->slots[slot_idx].t_occupied = s->time;
+            if (!placed) {
+                s->violations++;
+                snprintf(s->violation_msg, sizeof(s->violation_msg),
+                         "Shelf%d full! Cannot shelve item %d", shelf_id, item_id);
+            }
 
-            cg->state = CS_ON_SHELF;
-            cg->location_id = shelf_id;
-            cg->t_shelved = s->time;
-            s->cargo_shelved++;
+            it->state = ITEM_ON_SHELF;
+            it->location_id = shelf_id;
+            it->t_shelved = s->time;
+            s->items_shelved++;
+            sh->total_vol += VOL_VAL[it->volume];
 
-            memmove(&r->cargo_ids[0], &r->cargo_ids[1],
-                    (r->cargo_cnt - 1) * sizeof(int));
-            r->cargo_cnt--;
-            r->load_vol -= VOL_VAL[cg->volume];
+            memmove(&r->items[0], &r->items[1],
+                    (r->item_cnt - 1) * sizeof(int));
+            r->item_cnt--;
+            r->load_vol -= VOL_VAL[it->volume];
         }
 
-        r->state = ROBOT_IDLE;
+        r->status = ROBOT_IDLE;
+        r->busy = 0;
+        break;
     }
 }

@@ -3,8 +3,8 @@
 
 #include "datatypes.h"
 
-void sim_init(SimState *s, int cargo_count, int random_seed);
+void sim_init(SimState *s, int item_count, int random_seed);
 void sim_run(SimState *s);
-void sim_print_stats(SimState *s);
+void sim_run_with_server(SimState *s, int ws_port);
 
 #endif

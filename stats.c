@@ -1,61 +1,62 @@
 #include "stats.h"
+#include <math.h>
 
-SimScore sim_compute_score(SimState *s) {
-    SimScore sc;
-    memset(&sc, 0, sizeof(sc));
+/*
+ * 评分公式 (PRD 1.3):
+ *   Sn = D * 3000 / (T + T0)
+ *
+ * D  = 难度系数 (基于货物数量)
+ * T  = 完成时间 (秒)
+ * T0 = 基准时间偏移 (60秒)
+ *
+ * 碰撞/违规 → 直接0分
+ */
 
-    sc.total_time   = s->time;
-    sc.total_cargo  = s->cargo_total;
-    sc.shelved_cargo = s->cargo_shelved;
-    sc.violations   = s->violations;
-    sc.collision    = s->collision_flag;
-
-    /* 吞吐率 */
-    if (sc.total_time > 0) {
-        sc.throughput = (double)sc.shelved_cargo / sc.total_time;
-    }
-
-    /*
-     * 评分公式:
-     *   base = (shelved / total) * 100    -- 上架率
-     *   time_bonus = max(0, 20 - total_time / 100)  -- 时间奖励(快则加分)
-     *   violation_penalty = violations * 50          -- 每次违规扣50分
-     *   collision_penalty = collision ? 100 : 0     -- 碰撞直接扣100
-     *   score = max(0, base + time_bonus - violation_penalty - collision_penalty)
-     */
-    double base = sc.total_cargo > 0 ?
-                  ((double)sc.shelved_cargo / sc.total_cargo) * 100.0 : 0.0;
-
-    double time_bonus = 200.0 - sc.total_time * 0.5;
-    if (time_bonus < 0) time_bonus = 0;
-
-    double violation_penalty = sc.violations * 50.0;
-    double collision_penalty = sc.collision ? 100.0 : 0.0;
-
-    sc.score = base + time_bonus - violation_penalty - collision_penalty;
-    if (sc.score < 0) sc.score = 0;
-
-    return sc;
+void stats_init(SimState *s) {
+    s->score = 0.0;
+    s->difficulty = 1.0;
+    s->collision_flag = 0;
+    s->violations = 0;
+    s->violation_msg[0] = '\0';
 }
 
-void sim_print_score(SimState *s) {
-    SimScore sc = sim_compute_score(s);
+void stats_update(SimState *s) {
+    /* 难度系数: 货物数 / 10 (最小1.0) */
+    s->difficulty = (double)s->items_total / 10.0;
+    if (s->difficulty < 1.0) s->difficulty = 1.0;
+
+    /* 违规或碰撞 → 0分 */
+    if (s->violations > 0 || s->collision_flag) {
+        s->score = 0.0;
+        return;
+    }
+
+    /* 计算得分 */
+    double D = s->difficulty;
+    double T = s->time;  /* ticks → 秒 (1 tick = 1 秒) */
+    double T0 = 60.0;    /* 基准偏移 */
+
+    s->score = D * 3000.0 / (T + T0);
+}
+
+void stats_print(SimState *s) {
+    stats_update(s);
 
     printf("\n========================================\n");
-    printf("       仿真统计与评分\n");
+    printf("         仿真统计与评分\n");
     printf("========================================\n");
-    printf(" 总仿真时间:      %.0f ticks\n", sc.total_time);
-    printf(" 总货物:          %d\n", sc.total_cargo);
-    printf(" 已上架:          %d\n", sc.shelved_cargo);
-    printf(" 上架率:          %.1f%%\n",
-           sc.total_cargo > 0 ? 100.0 * sc.shelved_cargo / sc.total_cargo : 0.0);
-    printf(" 吞吐率:          %.3f cargo/tick\n", sc.throughput);
-    printf(" 约束违规:        %d\n", sc.violations);
-    printf(" 碰撞:            %s\n", sc.collision ? "发生碰撞!" : "无");
-    printf(" 最终得分:        %.1f\n", sc.score);
+    printf(" 难度系数 (D):     %.1f\n", s->difficulty);
+    printf(" 总仿真时间 (T):   %.0f 秒\n", s->time);
+    printf(" 总货物:           %d\n", s->items_total);
+    printf(" 已上架:           %d\n", s->items_shelved);
+    printf(" 上架率:           %.1f%%\n",
+           s->items_total > 0 ? 100.0 * s->items_shelved / s->items_total : 0.0);
+    printf(" 约束违规:         %d\n", s->violations);
+    printf(" 碰撞:             %s\n", s->collision_flag ? "发生碰撞!" : "无");
+    printf(" 最终得分 (Sn):    %.1f\n", s->score);
 
     if (s->violation_msg[0]) {
-        printf(" 最后错误信息:    %s\n", s->violation_msg);
+        printf(" 终止原因:         %s\n", s->violation_msg);
     }
     printf("========================================\n");
 }

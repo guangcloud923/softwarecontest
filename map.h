@@ -3,16 +3,12 @@
 
 #include "datatypes.h"
 
-/* 初始化地图拓扑 */
 void map_init(SimState *s);
-
-/* 寻路: Dijkstra, 返回路径长度, 路径写入path */
-int  map_find_path(SimState *s, int start_node, int end_node, int *path_out);
-
-/* 节点名称(调试用) */
-const char *node_name(int id);
-
-/* 两个节点是否相邻 */
-int  nodes_adjacent(SimState *s, int a, int b);
+int  map_is_walkable(SimState *s, int x, int y);
+int  map_is_crossroad(SimState *s, int x, int y);
+int  map_is_narrow(SimState *s, int x, int y);
+void map_get_neighbors(SimState *s, int x, int y, Pos2D *neighbors, int *cnt);
+int  map_manhattan(int x1, int y1, int x2, int y2);
+void map_recalc_special(SimState *s);
 
 #endif

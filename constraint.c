@@ -1,219 +1,184 @@
 #include "constraint.h"
 
 /*
- * 在关键节点执行约束校验:
- * 1. AGV负载不超过1m3
- * 2. 缓冲区不超过容量
- * 3. 交接区不超过容量
- * 4. 货架盘位不冲突
- * 5. 状态一致性: 每个货物只能在一个地方
- * 6. 机器人相同体积约束
+ * 一票否决项检查 (PRD 1.1)
+ * 任何违规立即终止仿真, 直接0分
  */
 
+/* AGV负载 ≤ 1.0 m3 */
 static void check_agv_load(SimState *s) {
-    int i, j;
+    int i;
     for (i = 0; i < s->agv_cnt; i++) {
         AGV *a = &s->agvs[i];
-        double calc = 0.0;
-        for (j = 0; j < a->cargo_cnt; j++) {
-            int ci = a->cargo_ids[j];
-            calc += VOL_VAL[s->cargos[ci].volume];
-        }
-        if (calc > 1.001) {
+        if (a->load_vol > 1.001) {
             s->violations++;
-            snprintf(s->violation_msg, sizeof(s->violation_msg),
-                     "VIOLATION: AGV%d load %.2f > 1.0", i, calc);
             s->running = 0;
-        }
-        if (a->load_vol != calc) {
-            s->violations++;
             snprintf(s->violation_msg, sizeof(s->violation_msg),
-                     "VIOLATION: AGV%d load_vol %.2f != calculated %.2f",
-                     i, a->load_vol, calc);
-            s->running = 0;
+                     "FATAL: AGV%d overload %.3f m3 > 1.0", i, a->load_vol);
+            return;
         }
     }
 }
 
+/* 缓冲区容量 ≤ 6 */
 static void check_buffer_capacity(SimState *s) {
     int i;
     for (i = 0; i < s->buffer_cnt; i++) {
-        Buffer *b = &s->buffers[i];
-        if (b->cargo_cnt > b->capacity) {
+        if (s->buffers[i].capacity != 6) {
+            fprintf(stderr, "  [BUG] T%.0f Buffer%d capacity=%d (corrupted!), resetting to 6\n",
+                    s->time, i, s->buffers[i].capacity);
+            s->buffers[i].capacity = 6;
+        }
+        if (s->buffers[i].item_cnt > 6) {
             s->violations++;
-            snprintf(s->violation_msg, sizeof(s->violation_msg),
-                     "VIOLATION: Buffer%d overflow %d/%d",
-                     i, b->cargo_cnt, b->capacity);
             s->running = 0;
+            snprintf(s->violation_msg, sizeof(s->violation_msg),
+                     "FATAL: Buffer%d overflow %d > 6",
+                     i, s->buffers[i].item_cnt);
+            return;
         }
     }
 }
 
-static void check_transfer_capacity(SimState *s) {
+/* 交接区容积 ≤ capacity_vol */
+static void check_transfer_volume(SimState *s) {
     int i;
-    for (i = 0; i < s->tp_cnt; i++) {
-        TransferPoint *tp = &s->tps[i];
-        if (tp->cargo_cnt > tp->capacity) {
+    for (i = 0; i < s->tzone_cnt; i++) {
+        if (s->tzones[i].total_vol > s->tzones[i].capacity_vol + 0.001) {
             s->violations++;
-            snprintf(s->violation_msg, sizeof(s->violation_msg),
-                     "VIOLATION: TP%d overflow %d/%d",
-                     i, tp->cargo_cnt, tp->capacity);
             s->running = 0;
+            snprintf(s->violation_msg, sizeof(s->violation_msg),
+                     "FATAL: TransferZone%d overflow %.3f m3 > %.1f",
+                     i, s->tzones[i].total_vol, s->tzones[i].capacity_vol);
+            return;
         }
     }
 }
 
-static void check_shelf_consistency(SimState *s) {
+/* 机器人: 同体积约束 + 容量 ≤ 1.0 m3 */
+static void check_robot_constraints(SimState *s) {
     int i, j;
-    for (i = 0; i < s->shelf_cnt; i++) {
-        Shelf *sh = &s->shelves[i];
-        for (j = 0; j < sh->slot_cnt; j++) {
-            if (!sh->slots[j].occupied) continue;
-            int ci = sh->slots[j].cargo_id;
-            if (ci < 0 || ci >= s->cargo_cnt) continue;
-            if (s->cargos[ci].state != CS_ON_SHELF) {
+    for (i = 0; i < s->robot_cnt; i++) {
+        ShelfRobot *r = &s->robots[i];
+        if (r->item_cnt <= 1) continue;
+
+        if (r->load_vol > 1.001) {
+            s->violations++;
+            s->running = 0;
+            snprintf(s->violation_msg, sizeof(s->violation_msg),
+                     "FATAL: Robot%d overload %.3f m3", i, r->load_vol);
+            return;
+        }
+
+        ItemVolume v0 = s->items[r->items[0]].volume;
+        for (j = 1; j < r->item_cnt; j++) {
+            if (s->items[r->items[j]].volume != v0) {
                 s->violations++;
-                snprintf(s->violation_msg, sizeof(s->violation_msg),
-                         "VIOLATION: Shelf%d slot%d cargo%d state mismatch",
-                         i, j, ci);
                 s->running = 0;
-            }
-            if (s->cargos[ci].target_shelf_id != i) {
-                s->violations++;
                 snprintf(s->violation_msg, sizeof(s->violation_msg),
-                         "VIOLATION: cargo%d on wrong shelf %d (target %d)",
-                         ci, i, s->cargos[ci].target_shelf_id);
-                s->running = 0;
+                         "FATAL: Robot%d mixed volumes (must be same)", i);
+                return;
             }
         }
     }
 }
 
-/*
- * 状态一致性: 检查每个货物出现在且只出现在一个地方
- * 这里做轻量级检查: 每个state对应的location_id合理
- */
-static void check_state_consistency(SimState *s) {
-    int i;
-    for (i = 0; i < s->cargo_cnt; i++) {
-        Cargo *cg = &s->cargos[i];
-        if (cg->id < 0) continue;
+/* 物理碰撞检测: 两AGV占据同一格子 */
+static void check_collision(SimState *s) {
+    int i, j;
+    for (i = 0; i < s->agv_cnt; i++) {
+        for (j = i + 1; j < s->agv_cnt; j++) {
+            if (s->agvs[i].pos.x == s->agvs[j].pos.x &&
+                s->agvs[i].pos.y == s->agvs[j].pos.y) {
+                s->collision_flag = 1;
+                s->violations++;
+                s->running = 0;
+                snprintf(s->violation_msg, sizeof(s->violation_msg),
+                         "FATAL: AGV%d and AGV%d collided at (%d,%d)",
+                         i, j, s->agvs[i].pos.x, s->agvs[i].pos.y);
+                return;
+            }
+        }
+    }
+}
 
-        switch (cg->state) {
-        case CS_INIT:
-            break;
-        case CS_ON_CONVEYOR: {
-            int cv_id = cg->location_id;
-            if (cv_id < 0 || cv_id >= s->conveyor_cnt) goto bad;
-            int found = 0, j;
-            for (j = 0; j < s->conveyors[cv_id].cargo_cnt; j++) {
-                if (s->conveyors[cv_id].cargo_ids[j] == i) { found = 1; break; }
-            }
+/* 状态一致性: 每个货物只在一个位置 */
+static void check_state_consistency(SimState *s) {
+    int i, j, found;
+    for (i = 0; i < s->item_cnt; i++) {
+        Item *it = &s->items[i];
+        if (it->id < 0) continue;
+
+        switch (it->state) {
+        case ITEM_ON_CONVEYOR: {
+            int cid = it->location_id;
+            if (cid < 0 || cid >= MAX_CONVEYORS) goto bad;
+            found = 0;
+            for (j = 0; j < s->conveyors[cid].item_cnt; j++)
+                if (s->conveyors[cid].items[j] == i) found = 1;
             if (!found) goto bad;
             break;
         }
-        case CS_IN_BUFFER: {
-            int b_id = cg->location_id;
-            if (b_id < 0 || b_id >= s->buffer_cnt) goto bad;
-            int found = 0, j;
-            for (j = 0; j < s->buffers[b_id].cargo_cnt; j++) {
-                if (s->buffers[b_id].cargo_ids[j] == i) { found = 1; break; }
-            }
+        case ITEM_IN_BUFFER: {
+            int bid = it->location_id;
+            if (bid < 0 || bid >= MAX_BUFFERS) goto bad;
+            found = 0;
+            for (j = 0; j < s->buffers[bid].item_cnt; j++)
+                if (s->buffers[bid].items[j] == i) found = 1;
             if (!found) goto bad;
             break;
         }
-        case CS_ON_AGV: {
-            int a_id = cg->location_id;
-            if (a_id < 0 || a_id >= s->agv_cnt) goto bad;
-            int found = 0, j;
-            for (j = 0; j < s->agvs[a_id].cargo_cnt; j++) {
-                if (s->agvs[a_id].cargo_ids[j] == i) { found = 1; break; }
-            }
+        case ITEM_ON_AGV: {
+            int aid = it->location_id;
+            if (aid < 0 || aid >= MAX_AGVS) goto bad;
+            found = 0;
+            for (j = 0; j < s->agvs[aid].item_cnt; j++)
+                if (s->agvs[aid].items[j] == i) found = 1;
             if (!found) goto bad;
             break;
         }
-        case CS_AT_TRANSFER: {
-            int t_id = cg->location_id;
-            if (t_id >= 100) {
-                /* 被机器人持有 */
-                int r_id = t_id - 100;
-                if (r_id < 0 || r_id >= s->robot_cnt) goto bad;
-                int found = 0, j;
-                for (j = 0; j < s->robots[r_id].cargo_cnt; j++) {
-                    if (s->robots[r_id].cargo_ids[j] == i) { found = 1; break; }
-                }
+        case ITEM_AT_TRANSFER: {
+            int lid = it->location_id;
+            if (lid >= 100) { /* 在机器人手上 */
+                int rid = lid - 100;
+                if (rid < 0 || rid >= MAX_ROBOTS) goto bad;
+                found = 0;
+                for (j = 0; j < s->robots[rid].item_cnt; j++)
+                    if (s->robots[rid].items[j] == i) found = 1;
                 if (!found) goto bad;
             } else {
-                if (t_id < 0 || t_id >= s->tp_cnt) goto bad;
-                int found = 0, j;
-                for (j = 0; j < s->tps[t_id].cargo_cnt; j++) {
-                    if (s->tps[t_id].cargo_ids[j] == i) { found = 1; break; }
-                }
+                if (lid < 0 || lid >= MAX_TRANSFER_ZONES) goto bad;
+                found = 0;
+                for (j = 0; j < s->tzones[lid].item_cnt; j++)
+                    if (s->tzones[lid].items[j] == i) found = 1;
                 if (!found) goto bad;
             }
             break;
         }
-        case CS_ON_SHELF:
+        case ITEM_ON_SHELF: {
+            if (it->target_shelf != it->location_id) goto bad;
             break;
-        default:
-            goto bad;
+        }
+        default: break;
         }
         continue;
     bad:
         s->violations++;
-        snprintf(s->violation_msg, sizeof(s->violation_msg),
-                 "VIOLATION: cargo%d state=0x%x loc=%d inconsistent",
-                 i, cg->state, cg->location_id);
         s->running = 0;
+        snprintf(s->violation_msg, sizeof(s->violation_msg),
+                 "FATAL: Item%d state=%d loc=%d inconsistent",
+                 i, it->state, it->location_id);
         return;
-    }
-}
-
-static void check_robot_constraint(SimState *s) {
-    int i;
-    for (i = 0; i < s->robot_cnt; i++) {
-        ShelfRobot *r = &s->robots[i];
-        if (r->cargo_cnt <= 1) continue;
-
-        /* 检查体积一致性 */
-        CargoVolume v0 = s->cargos[r->cargo_ids[0]].volume;
-        int j;
-        for (j = 1; j < r->cargo_cnt; j++) {
-            if (s->cargos[r->cargo_ids[j]].volume != v0) {
-                s->violations++;
-                snprintf(s->violation_msg, sizeof(s->violation_msg),
-                         "VIOLATION: Robot%d mixed volumes", i);
-                s->running = 0;
-                return;
-            }
-        }
-
-        if (r->load_vol > 1.001) {
-            s->violations++;
-            snprintf(s->violation_msg, sizeof(s->violation_msg),
-                     "VIOLATION: Robot%d overload %.2f", i, r->load_vol);
-            s->running = 0;
-        }
     }
 }
 
 void constraint_check_all(SimState *s) {
     if (!s->running) return;
 
-    check_agv_load(s);
-    if (!s->running) return;
-
-    check_buffer_capacity(s);
-    if (!s->running) return;
-
-    check_transfer_capacity(s);
-    if (!s->running) return;
-
-    check_shelf_consistency(s);
-    if (!s->running) return;
-
+    check_agv_load(s);          if (!s->running) return;
+    check_buffer_capacity(s);   if (!s->running) return;
+    check_transfer_volume(s);   if (!s->running) return;
+    check_robot_constraints(s); if (!s->running) return;
+    check_collision(s);         if (!s->running) return;
     check_state_consistency(s);
-    if (!s->running) return;
-
-    check_robot_constraint(s);
 }

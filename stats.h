@@ -3,17 +3,8 @@
 
 #include "datatypes.h"
 
-typedef struct {
-    double total_time;
-    int    total_cargo;
-    int    shelved_cargo;
-    double throughput;
-    int    violations;
-    int    collision;
-    double score;
-} SimScore;
-
-SimScore sim_compute_score(SimState *s);
-void     sim_print_score(SimState *s);
+void stats_init(SimState *s);
+void stats_update(SimState *s);
+void stats_print(SimState *s);
 
 #endif

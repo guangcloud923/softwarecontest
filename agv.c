@@ -1,346 +1,363 @@
 #include "agv.h"
 #include "map.h"
+#include "scheduler.h"
+#include "pathfinding.h"
+
+/* 停车位坐标 */
+static const Pos2D PARK_POS[MAX_AGVS] = {{1,0}, {14,0}, {1,6}, {14,6}};
 
 void agv_init(SimState *s) {
-    int i;
-    int park_nodes[MAX_AGVS] = {12, 13, 14, 15};
     s->agv_cnt = MAX_AGVS;
+    int i;
 
     for (i = 0; i < s->agv_cnt; i++) {
-        s->agvs[i].id = i;
-        s->agvs[i].cur_node = park_nodes[i];
-        s->agvs[i].prev_node = park_nodes[i];
-        s->agvs[i].target_node = park_nodes[i];
-        s->agvs[i].state = AGV_IDLE;
-        s->agvs[i].load_vol = 0.0;
-        s->agvs[i].cargo_cnt = 0;
-        s->agvs[i].path_len = 0;
-        s->agvs[i].path_idx = 0;
-        s->agvs[i].wait_ticks = 0;
-        s->agvs[i].buffer_assigned = -1;
-        s->agvs[i].transfer_assigned = -1;
-        s->agvs[i].busy = 0;
+        AGV *a = &s->agvs[i];
+        a->id = i;
+        a->pos = PARK_POS[i];
+        a->cur_t = 0;
+        a->status = AGV_IDLE;
+        a->load_vol = 0.0;
+        a->item_cnt = 0;
+        a->buffer_target = -1;
+        a->transfer_target = -1;
+        a->busy = 0;
+        a->traj_len = 0;
+        a->traj_idx = 0;
+        a->constraint_cnt = 0;
+        a->wait_ticks = 0;
+        a->home_park = i;
     }
 }
 
-/* 判断AGV是否可以直接取货(路径上没有其他AGV阻挡) */
-/* 不检查目标节点(最后节点), 因为多个AGV需要依次到达同一个目标 */
-static int can_agv_move_to(SimState *s, int agv_id, int target_node) {
+/* 找最近空闲停车位 */
+static int find_nearest_park(SimState *s, int agv_id) {
     AGV *a = &s->agvs[agv_id];
-    int path[MAX_NODES];
-    int len = map_find_path(s, a->cur_node, target_node, path);
-    if (len < 2) return 0;
-
-    /* 检查路径上每个中间节点是否被其他AGV占用(不检查起点和终点) */
-    int i, j;
-    for (i = 1; i < len - 1; i++) {
-        int node = path[i];
+    int best = a->home_park, best_dist = 9999;
+    int i;
+    for (i = 0; i < MAX_AGVS; i++) {
+        int occupied = 0;
+        int j;
         for (j = 0; j < s->agv_cnt; j++) {
             if (j == agv_id) continue;
-            if (s->agvs[j].cur_node == node) return 0;
-        }
-    }
-    return 1;
-}
-
-/* 找最优AGV分配任务 */
-static void try_dispatch_agv(SimState *s, int buf_id) {
-    Buffer *b = &s->buffers[buf_id];
-    if (b->cargo_cnt == 0) return;
-    if (b->agv_assigned >= 0) return; /* 已有AGV前往 */
-
-    /* 找缓冲区对应的交接区: buf0->TP1, buf1->TP2 */
-    int tp_id = buf_id;
-
-    /* 查找最优AGV: 空闲且路径通畅 */
-    int best_agv = -1, best_dist = 999999;
-    int i;
-    for (i = 0; i < s->agv_cnt; i++) {
-        if (s->agvs[i].busy) continue;
-        if (s->agvs[i].state != AGV_IDLE) continue;
-
-        /* 检查此AGV是否能到达缓冲区 */
-        if (can_agv_move_to(s, i, b->node_id)) {
-            int path[MAX_NODES];
-            int len = map_find_path(s, s->agvs[i].cur_node, b->node_id, path);
-            if (len > 0 && len < best_dist) {
-                best_dist = len;
-                best_agv = i;
+            AGV *oa = &s->agvs[j];
+            /* 有其他AGV正停在车位上(无论状态) */
+            if (oa->pos.x == PARK_POS[i].x &&
+                oa->pos.y == PARK_POS[i].y) {
+                occupied = 1;
+                break;
+            }
+            /* 有其他AGV的活跃轨迹终点是此车位 */
+            if (oa->traj_len > 0 && oa->traj_idx < oa->traj_len) {
+                TrajectoryPoint ep = oa->trajectory[oa->traj_len - 1];
+                if (ep.x == PARK_POS[i].x && ep.y == PARK_POS[i].y) {
+                    occupied = 1;
+                    break;
+                }
             }
         }
-    }
-
-    if (best_agv < 0) return; /* 无可用AGV */
-
-    /* TP容量门控: 当交接区已满且有AGV正在前往时, 不再派发新AGV */
-    {
-        TransferPoint *tp = &s->tps[tp_id];
-        if (tp->cargo_cnt >= tp->capacity) {
-            int incoming = 0;
-            int k;
-            for (k = 0; k < s->agv_cnt; k++) {
-                if (s->agvs[k].transfer_assigned == tp_id && s->agvs[k].busy)
-                    incoming++;
-            }
-            if (incoming > 0) return;
+        if (occupied) continue;
+        int dist = map_manhattan(a->pos.x, a->pos.y, PARK_POS[i].x, PARK_POS[i].y);
+        if (dist < best_dist) {
+            best_dist = dist;
+            best = i;
         }
     }
-
-    /* 分配任务 */
-    AGV *a = &s->agvs[best_agv];
-    a->buffer_assigned = buf_id;
-    a->transfer_assigned = tp_id;
-    a->busy = 1;
-    b->agv_assigned = best_agv;
-
-    /* 规划路径到缓冲区 */
-    a->path_len = map_find_path(s, a->cur_node, b->node_id, a->path);
-    a->path_idx = 0;
-    a->state = AGV_TO_BUFFER;
-
-    /* printf("  AGV%d dispatched: buf%d -> node%d\n", best_agv, buf_id, b->node_id); */
+    return best;
 }
 
-/* 更新AGV沿路径移动一步 */
-static void agv_move(SimState *s, int id) {
+/* 沿轨迹移动一步 */
+static void agv_move_along_traj(SimState *s, int id) {
     AGV *a = &s->agvs[id];
-    if (a->path_len == 0) return;
+    if (a->traj_len == 0) return;
 
-    int next_idx = a->path_idx + 1;
-    if (next_idx >= a->path_len) return;
+    /* 找到当前时间对应的轨迹点 */
+    int next_t = a->cur_t + 1;
+    while (a->traj_idx < a->traj_len && a->trajectory[a->traj_idx].t < next_t) {
+        a->traj_idx++;
+    }
 
-    int next_node = a->path[next_idx];
+    if (a->traj_idx >= a->traj_len) return;
 
-    /* 避让检测: 下一节点是否被其他AGV占用 */
-    int j;
-    for (j = 0; j < s->agv_cnt; j++) {
-        if (j == id) continue;
-        if (s->agvs[j].cur_node != next_node) continue;
-
-        /* 发现阻塞 */
-        AGV *ba = &s->agvs[j];
-
-        /* 情况1: 对面AGV也在往我这里走 → 正常交换 */
-        if (ba->path_len > ba->path_idx + 1) {
-            int their_next = ba->path[ba->path_idx + 1];
-            if (their_next == a->cur_node) {
-                ba->prev_node = ba->cur_node;
-                ba->cur_node = their_next;
-                ba->path_idx++;
-                a->prev_node = a->cur_node;
-                a->cur_node = next_node;
-                a->path_idx = next_idx;
-                return;
+    TrajectoryPoint *tp = &a->trajectory[a->traj_idx];
+    if (tp->t == next_t) {
+        /* 运行时安全校验: 目标格已被其他AGV占据则原地等待 */
+        int j;
+        for (j = 0; j < s->agv_cnt; j++) {
+            if (j == id) continue;
+            if (s->agvs[j].pos.x == tp->x && s->agvs[j].pos.y == tp->y) {
+                return; /* 等待一 tick */
             }
         }
+        a->pos.x = tp->x;
+        a->pos.y = tp->y;
+        a->cur_t = next_t;
+    }
+    /* 如果tp->t > next_t, 说明需要等待(原地不动) */
+}
 
-        /* 情况2: 对面AGV空闲(IDLE) → 无论在哪都让路, 回停车位一步 */
-        if (ba->state == AGV_IDLE && ba->cargo_cnt == 0) {
-            int park_nodes[] = {12, 13, 14, 15};
-            int ba_park = park_nodes[ba->id];
-            int ba_path[MAX_NODES];
-            int ba_plen = map_find_path(s, ba->cur_node, ba_park, ba_path);
-            if (ba_plen >= 2) {
-                int ba_next = ba_path[1];
-                int safe = 1;
-                int kj;
-                for (kj = 0; kj < s->agv_cnt && safe; kj++) {
-                    if (kj == ba->id) continue;
-                    if (kj == id) continue; /* 主动AGV正要离开 */
-                    if (s->agvs[kj].cur_node == ba_next) safe = 0;
-                }
-                if (safe) {
-                    ba->prev_node = ba->cur_node;
-                    ba->cur_node = ba_next;
-                }
-            }
-            /* 不管idle AGV有没有移动, 主动AGV都前进 */
-            a->prev_node = a->cur_node;
-            a->cur_node = next_node;
-            a->path_idx = next_idx;
-            return;
-        }
-        /* 无法让路, 原地等待 */
+/* 从缓冲区装载货物(使用背包拼单) */
+static void agv_load_from_buffer(SimState *s, int id) {
+    AGV *a = &s->agvs[id];
+    Buffer *b = &s->buffers[a->buffer_target];
+
+    int selected[32], sel_cnt;
+    knapsack_batch(s, a->buffer_target, selected, &sel_cnt);
+
+    if (sel_cnt == 0) {
+        /* 缓冲区空了, 释放AGV */
+        b->agv_assigned = -1;
+        a->busy = 0;
+        a->status = AGV_RETURNING;
+        a->buffer_target = -1;
+        a->traj_len = 0;
+        a->traj_idx = 0;
         return;
     }
 
-    /* 移动一步 */
-    a->prev_node = a->cur_node;
-    a->cur_node = next_node;
-    a->path_idx = next_idx;
-}
-
-/* 向缓冲区装载货物 */
-static void agv_load(SimState *s, int id) {
-    AGV *a = &s->agvs[id];
-    Buffer *b = &s->buffers[a->buffer_assigned];
-    if (!b) return;
-
-    /* 尽可能多地装载 */
     int loaded = 0;
-    while (b->cargo_cnt > 0 && a->load_vol < 0.99) {
-        /* 找第一个适合的货物 */
-        int ci = b->cargo_ids[0];
-        Cargo *cg = &s->cargos[ci];
+    int si;
+    for (si = 0; si < sel_cnt; si++) {
+        int item_id = selected[si];
+        Item *it = &s->items[item_id];
+        double vol = VOL_VAL[it->volume];
 
-        double vol = VOL_VAL[cg->volume];
-        if (a->load_vol + vol > 1.001) break; /* 超体积 */
+        if (a->load_vol + vol > 1.001) continue;
+        if (a->item_cnt >= MAX_ITEMS_PER_AGV) break;
 
-        /* 装载 */
-        memmove(&b->cargo_ids[0], &b->cargo_ids[1],
-                (b->cargo_cnt - 1) * sizeof(int));
-        b->cargo_cnt--;
-        a->cargo_ids[a->cargo_cnt++] = ci;
+        /* 从缓冲区移除该货物 */
+        int pos = -1;
+        int pi;
+        for (pi = 0; pi < b->item_cnt; pi++) {
+            if (b->items[pi] == item_id) { pos = pi; break; }
+        }
+        if (pos < 0) continue;
+
+        memmove(&b->items[pos], &b->items[pos + 1],
+                (b->item_cnt - pos - 1) * sizeof(int));
+        b->item_cnt--;
+
+        a->items[a->item_cnt++] = item_id;
         a->load_vol += vol;
-        cg->state = CS_ON_AGV;
-        cg->location_id = id;
+        it->state = ITEM_ON_AGV;
+        it->location_id = a->id;
         loaded = 1;
     }
 
     if (loaded) {
-        a->state = AGV_TO_TRANSFER;
-        /* 规划到交接区路径 */
-        TransferPoint *tp = &s->tps[a->transfer_assigned];
-        a->path_len = map_find_path(s, a->cur_node, tp->node_id, a->path);
-        a->path_idx = 0;
         b->agv_assigned = -1;
-    }
-}
-
-/* 向交接区卸载货物 */
-static void agv_unload(SimState *s, int id) {
-    AGV *a = &s->agvs[id];
-    TransferPoint *tp = &s->tps[a->transfer_assigned];
-
-    while (a->cargo_cnt > 0 && tp->cargo_cnt < tp->capacity) {
-        int ci = a->cargo_ids[0];
-        Cargo *cg = &s->cargos[ci];
-
-        memmove(&a->cargo_ids[0], &a->cargo_ids[1],
-                (a->cargo_cnt - 1) * sizeof(int));
-        a->cargo_cnt--;
-        a->load_vol -= VOL_VAL[cg->volume];
-
-        tp->cargo_ids[tp->cargo_cnt++] = ci;
-        cg->state = CS_AT_TRANSFER;
-        cg->location_id = tp->id;
-    }
-
-    if (a->cargo_cnt > 0) {
-        /* 未卸完(TP满), 继续等待 */
-        a->state = AGV_WAIT_TRANSFER;
-        a->wait_ticks = 0;
+        a->transfer_target = select_best_transfer(s, id);
+        a->status = AGV_MOVING_TO_TRANSFER;
+        a->traj_len = 0;
+        a->traj_idx = 0;
     } else {
-        /* AGV回到空闲 */
+        /* 没装上货, 返回停车位 */
         a->busy = 0;
-        a->state = AGV_IDLE;
-        a->buffer_assigned = -1;
-        a->transfer_assigned = -1;
+        a->buffer_target = -1;
+        a->traj_len = 0;
+        a->traj_idx = 0;
+        a->status = AGV_RETURNING;
     }
 }
 
-void agv_dispatch(SimState *s) {
-    /* 检查缓冲区是否有待处理货物, 尝试分配AGV */
-    int i;
-    for (i = 0; i < s->buffer_cnt; i++) {
-        try_dispatch_agv(s, i);
+/* 检查货物是否匹配交接区的机器人管辖范围 */
+static int item_matches_tz(Item *it, int tz_id) {
+    int shelf = it->target_shelf;
+    if (tz_id < 2) return (shelf == 0 || shelf == 1);  /* Robot 0: shelf 0,1 */
+    return (shelf == 2 || shelf == 3);                  /* Robot 1: shelf 2,3 */
+}
+
+/* 向交接区卸载货物(仅卸匹配的货物) */
+static void agv_unload_to_transfer(SimState *s, int id) {
+    AGV *a = &s->agvs[id];
+    TransferZone *tz = &s->tzones[a->transfer_target];
+    int unloaded = 0;
+
+    int i = 0;
+    while (i < a->item_cnt) {
+        int item_id = a->items[i];
+        Item *it = &s->items[item_id];
+
+        /* 跳过不匹配本交接区的货物 */
+        if (!item_matches_tz(it, a->transfer_target)) {
+            i++;
+            continue;
+        }
+
+        double vol = VOL_VAL[it->volume];
+        if (tz->total_vol + vol > tz->capacity_vol + 0.001) break;
+
+        /* 从AGV移除货物i */
+        memmove(&a->items[i], &a->items[i + 1],
+                (a->item_cnt - i - 1) * sizeof(int));
+        a->item_cnt--;
+        a->load_vol -= vol;
+
+        tz->items[tz->item_cnt++] = item_id;
+        tz->total_vol += vol;
+        it->state = ITEM_AT_TRANSFER;
+        it->location_id = tz->id;
+        unloaded = 1;
+        /* 不递增i, 因为下一元素移到了当前位置 */
+    }
+
+    if (a->item_cnt > 0) {
+        /* 还有货物: 检查是否属于另一个交接区 */
+        int first_item = a->items[0];
+        Item *it = &s->items[first_item];
+        if (!item_matches_tz(it, a->transfer_target)) {
+            /* 剩余货物不匹配当前区, 换目标交接区 */
+            a->transfer_target = select_best_transfer(s, id);
+            a->status = AGV_MOVING_TO_TRANSFER;
+            a->traj_len = 0; a->traj_idx = 0;
+            a->busy = 1;
+        } else if (!unloaded) {
+            /* 匹配但交接区满, 等待 */
+            a->status = AGV_WAITING;
+            a->wait_ticks = 0;
+            a->busy = 0;
+        } else {
+            /* 卸了一部分, 继续等待卸货 */
+            a->status = AGV_WAITING;
+            a->wait_ticks = 0;
+            a->busy = 0;
+        }
+    } else {
+        /* 尝试直接前往有货的缓冲区(不空返回公园) */
+        int direct = -1;
+        int i;
+        for (i = 0; i < s->buffer_cnt; i++) {
+            if (s->buffers[i].item_cnt > 0 && s->buffers[i].agv_assigned < 0) {
+                direct = i;
+                break;
+            }
+        }
+        if (direct >= 0) {
+            a->busy = 1;
+            a->status = AGV_MOVING_TO_BUFFER;
+            a->buffer_target = direct;
+            a->transfer_target = -1;
+            a->traj_len = 0;
+            a->traj_idx = 0;
+            s->buffers[direct].agv_assigned = id;
+        } else {
+            a->busy = 0;
+            a->status = AGV_RETURNING;
+            a->buffer_target = -1;
+            a->transfer_target = -1;
+            a->traj_len = 0;
+            a->traj_idx = 0;
+        }
     }
 }
 
 void agv_step(SimState *s, int id) {
     AGV *a = &s->agvs[id];
 
-    switch (a->state) {
-    case AGV_IDLE: {
-        /* 空闲时如果不在停车位, 自动回park (但只在有明确路径时执行) */
-        static const int park_home[] = {12, 13, 14, 15};
-        int home = park_home[a->id];
-        if (a->cur_node != home && a->cargo_cnt == 0) {
-            int path_to_home[MAX_NODES];
-            int plen = map_find_path(s, a->cur_node, home, path_to_home);
-            if (plen >= 2) {
-                /* 检查第一步是否安全 */
-                int next = path_to_home[1];
-                int blocked = 0;
-                int j;
-                for (j = 0; j < s->agv_cnt; j++) {
-                    if (j == id) continue;
-                    if (s->agvs[j].cur_node == next) { blocked = 1; break; }
+    a->cur_t = (int)s->time;
+
+    switch (a->status) {
+    case AGV_IDLE:
+        /* 空闲时留在停车位, 如果不在停车位则返回 */
+        {
+            int at_park = 0;
+            int i;
+            for (i = 0; i < MAX_AGVS; i++) {
+                if (a->pos.x == PARK_POS[i].x && a->pos.y == PARK_POS[i].y) {
+                    at_park = 1;
+                    break;
                 }
-                if (!blocked) {
-                    /* 走一步回家 */
-                    a->prev_node = a->cur_node;
-                    a->cur_node = next;
-                }
+            }
+            if (!at_park) {
+                a->status = AGV_RETURNING;
+                a->busy = 0;
+            }
+        }
+        if (a->traj_len > 0 && a->traj_idx < a->traj_len) {
+            agv_move_along_traj(s, id);
+            if (a->traj_idx >= a->traj_len) {
+                a->traj_len = 0;
+                a->traj_idx = 0;
+                a->busy = 0;
             }
         }
         break;
-    }
 
-    case AGV_TO_BUFFER:
-        /* 向缓冲区移动(或回家) */
-        agv_move(s, id);
-        if (!s->running) return;
-
-        if (a->buffer_assigned >= 0) {
-            /* 目标: 缓冲区 */
-            if (a->cur_node == s->nodes[s->buffers[a->buffer_assigned].node_id].id) {
-                a->state = AGV_LOADING;
-                agv_load(s, id);
-                if (!s->running) return;
-            }
-        } else {
-            /* 目标: 回家 (buffer_assigned==-1 表示回家模式) */
-            if (a->cur_node == a->target_node) {
-                a->state = AGV_IDLE;
-                a->path_len = 0;
+    case AGV_MOVING_TO_BUFFER:
+        if (a->traj_len == 0 || a->traj_idx >= a->traj_len) {
+            Buffer *b = &s->buffers[a->buffer_target];
+            plan_agv_to_target(s, id, b->pos.x, b->pos.y);
+        }
+        if (a->traj_len > 0)
+            agv_move_along_traj(s, id);
+        {
+            Buffer *b = &s->buffers[a->buffer_target];
+            if (a->pos.x == b->pos.x && a->pos.y == b->pos.y) {
+                a->status = AGV_LOADING;
+                a->traj_len = 0; a->traj_idx = 0;
             }
         }
         break;
 
     case AGV_LOADING:
-        agv_load(s, id);
+        agv_load_from_buffer(s, id);
         break;
 
-    case AGV_TO_TRANSFER:
-        agv_move(s, id);
-        if (!s->running) return;
+    case AGV_MOVING_TO_TRANSFER:
+        if (a->traj_len == 0 || a->traj_idx >= a->traj_len) {
+            TransferZone *tz = &s->tzones[a->transfer_target];
+            plan_agv_to_target(s, id, tz->pos.x, tz->pos.y);
+        }
+        if (a->traj_len > 0)
+            agv_move_along_traj(s, id);
+        {
+            TransferZone *tz = &s->tzones[a->transfer_target];
+            if (a->pos.x == tz->pos.x && a->pos.y == tz->pos.y) {
+                if (tz->total_vol < tz->capacity_vol - 0.001) {
+                    a->status = AGV_UNLOADING;
+                } else {
+                    a->status = AGV_WAITING;
+                    a->wait_ticks = 0;
+                }
+                a->traj_len = 0; a->traj_idx = 0;
+            }
+        }
+        break;
 
-        /* 到达交接区? */
-        if (a->cur_node == s->nodes[s->tps[a->transfer_assigned].node_id].id) {
-            if (s->tps[a->transfer_assigned].cargo_cnt <
-                s->tps[a->transfer_assigned].capacity) {
-                a->state = AGV_UNLOADING;
-                agv_unload(s, id);
+    case AGV_WAITING:
+        /* 等待交接区空闲 */
+        {
+            TransferZone *tz = &s->tzones[a->transfer_target];
+            if (tz->total_vol < tz->capacity_vol - 0.001) {
+                a->status = AGV_UNLOADING;
             } else {
-                a->state = AGV_WAIT_TRANSFER;
                 a->wait_ticks++;
             }
         }
         break;
 
-    case AGV_WAIT_TRANSFER:
-        /* 等待交接区空闲 */
-        if (s->tps[a->transfer_assigned].cargo_cnt <
-            s->tps[a->transfer_assigned].capacity) {
-            a->state = AGV_UNLOADING;
-            agv_unload(s, id);
-        } else {
-            a->wait_ticks++;
-        }
-        break;
-
     case AGV_UNLOADING:
-        agv_unload(s, id);
+        agv_unload_to_transfer(s, id);
         break;
 
-    case AGV_BLOCKED:
-        /* 不会进入此状态(碰撞直接原地等待), 保留为安全兜底 */
-        a->wait_ticks++;
-        if (a->wait_ticks > 50) {
-            a->wait_ticks = 0;
-            a->state = AGV_IDLE;
-            a->busy = 0;
+    case AGV_RETURNING:
+        if (a->traj_len == 0 || a->traj_idx >= a->traj_len) {
+            int park_idx = find_nearest_park(s, id);
+            Pos2D park = PARK_POS[park_idx];
+            plan_agv_to_target(s, id, park.x, park.y);
+        }
+        if (a->traj_len > 0)
+            agv_move_along_traj(s, id);
+        {
+            int i;
+            for (i = 0; i < MAX_AGVS; i++) {
+                if (a->pos.x == PARK_POS[i].x && a->pos.y == PARK_POS[i].y) {
+                    a->status = AGV_IDLE;
+                    a->busy = 0;
+                    a->traj_len = 0;
+                    a->traj_idx = 0;
+                    break;
+                }
+            }
         }
         break;
 

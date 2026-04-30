@@ -3,268 +3,365 @@
 #include "conveyor.h"
 #include "agv.h"
 #include "robot.h"
+#include "scheduler.h"
+#include "defrag.h"
 #include "constraint.h"
 #include "stats.h"
+#include "server.h"
+#include "pathfinding.h"
+#ifdef _WIN32
+#include <windows.h>
+#endif
 
-/*
- * 初始化仿真环境
- */
-void sim_init(SimState *s, int cargo_count, int seed) {
+/* 简单的LCG随机数 */
+static unsigned int lcg_rand(unsigned int *state) {
+    *state = *state * 1103515245 + 12345;
+    return (*state >> 16) & 0x7FFF;
+}
+
+void sim_init(SimState *s, int item_count, int seed) {
     memset(s, 0, sizeof(SimState));
     s->time = 0;
     s->running = 1;
-    s->max_time = MAX_TIME;
-    s->cargo_shelved = 0;
-    s->violations = 0;
-    s->collision_flag = 0;
-    s->violation_msg[0] = '\0';
+    s->paused = 0;
+    s->rng_state = (unsigned int)seed;
+    s->frame_id = 0;
 
-    srand(seed);
-
-    /* 初始化地图拓扑 */
+    /* 初始化地图 */
     map_init(s);
 
-    /* 初始化传送带 */
+    /* 初始化实体 */
     conveyor_init(s);
 
-    /* 初始化缓冲区 */
+    /* 缓冲区: B1在(3,2), B2在(12,2) */
     s->buffer_cnt = MAX_BUFFERS;
+    Pos2D buf_pos[] = {{3, 2}, {12, 2}};
     int i;
     for (i = 0; i < s->buffer_cnt; i++) {
         s->buffers[i].id = i;
-        s->buffers[i].cargo_cnt = 0;
+        s->buffers[i].pos = buf_pos[i];
+        s->buffers[i].item_cnt = 0;
         s->buffers[i].capacity = 6;
         s->buffers[i].conveyor_id = i;
-        s->buffers[i].node_id = (i == 0) ? 2 : 3;  /* B1->node2, B2->node3 */
         s->buffers[i].agv_assigned = -1;
     }
 
-    /* 初始化交接区 */
-    s->tp_cnt = MAX_TRANSFER_POINTS;
-    for (i = 0; i < s->tp_cnt; i++) {
-        s->tps[i].id = i;
-        s->tps[i].node_id = (i == 0) ? 5 : 6;  /* TP1->node5, TP2->node6 */
-        s->tps[i].cargo_cnt = 0;
-        s->tps[i].capacity = 4;
-        s->tps[i].shelf_id = i * 2;
-        s->tps[i].robot_id = i;
+    /* 交接区: T1(1,8), T2(5,8), T3(9,8), T4(13,8) */
+    s->tzone_cnt = MAX_TRANSFER_ZONES;
+    Pos2D tz_pos[] = {{1, 8}, {5, 8}, {10, 8}, {14, 8}};
+    for (i = 0; i < s->tzone_cnt; i++) {
+        s->tzones[i].id = i;
+        s->tzones[i].pos = tz_pos[i];
+        s->tzones[i].item_cnt = 0;
+        s->tzones[i].total_vol = 0.0;
+        s->tzones[i].capacity_vol = 2.0;
+        s->tzones[i].robot_id = (i < 2) ? 0 : 1;
+        s->tzones[i].shelf_ids[0] = i;
+        s->tzones[i].shelf_ids[1] = -1;
     }
 
-    /* 初始化货架 */
+    /* 货架: S1(1,10), S2(5,10), S3(9,10), S4(13,10) */
     s->shelf_cnt = MAX_SHELVES;
+    Pos2D sh_pos[] = {{1, 10}, {5, 10}, {9, 10}, {13, 10}};
     for (i = 0; i < s->shelf_cnt; i++) {
         s->shelves[i].id = i;
-        s->shelves[i].slot_cnt = 10;
-        s->shelves[i].robot_id = (i % 2 == 0) ? 0 : 1;  /* S0,S2->R0; S1,S3->R1 */
-        s->shelves[i].tp_id = (i % 2 == 0) ? 0 : 1;     /* S0,S2->TP0; S1,S3->TP1 */
-        s->shelves[i].node_id = 7 + i;                    /* S1->7, S2->8, S3->10, S4->11 */
-        int j;
-        for (j = 0; j < s->shelves[i].slot_cnt; j++) {
-            s->shelves[i].slots[j].id = j;
-            s->shelves[i].slots[j].occupied = 0;
-            s->shelves[i].slots[j].cargo_id = -1;
-        }
+        s->shelves[i].pos = sh_pos[i];
+        s->shelves[i].robot_id = (i % 2 == 0) ? 0 : 1;
+        s->shelves[i].tp_id = i;
+        s->shelves[i].total_vol = 0.0;
+        memset(s->shelves[i].slots, 0, sizeof(s->shelves[i].slots));
     }
 
-    /* 修正货架node_id: 地图中 node7=S1, node8=S2, node10=S3, node11=S4 */
-    int shelf_nodes[] = {7, 8, 10, 11};
-    for (i = 0; i < s->shelf_cnt; i++) {
-        s->shelves[i].node_id = shelf_nodes[i];
-    }
+    /* 刷新地图实体绑定 */
+    map_recalc_special(s);
 
-    /* 初始化AGV */
     agv_init(s);
-
-    /* 初始化机器人 */
     robot_init(s);
 
     /* 生成货物 */
-    int cargo_to_create = (cargo_count > 0 && cargo_count <= MAX_CARGOS) ?
-                           cargo_count : 20;
-    s->cargo_total = cargo_to_create;
+    int to_create = item_count;
+    if (to_create > MAX_ITEMS) to_create = MAX_ITEMS;
+    if (to_create < 1) to_create = 30;
+    s->items_total = to_create;
 
-    for (i = 0; i < cargo_to_create; i++) {
-        s->cargos[i].id = i;
-        /* 随机体积 */
-        int vol = rand() % 3;  /* 0,1,2 */
-        s->cargos[i].volume = (CargoVolume)vol;
-        /* 随机目标货架 */
-        s->cargos[i].target_shelf_id = rand() % MAX_SHELVES;
-        s->cargos[i].state = CS_INIT;
-        s->cargos[i].location_id = -1;
-        s->cargos[i].t_create = 0;
-        s->cargos[i].t_shelved = 0;
+    for (i = 0; i < to_create; i++) {
+        Item *it = &s->items[i];
+        it->id = i;
+        int vol = lcg_rand(&s->rng_state) % 3;
+        it->volume = (ItemVolume)vol;
+        it->target_shelf = lcg_rand(&s->rng_state) % MAX_SHELVES;
+        it->state = ITEM_INIT;
+        it->location_id = -1;
+        it->t_spawn = 0;
+        it->t_shelved = 0;
     }
-    s->cargo_cnt = cargo_to_create;
+    s->item_cnt = to_create;
+    s->next_item_id = to_create;
 
-    /* 标记未使用槽位无效, 防止spawn误取 */
-    for (i = cargo_to_create; i < MAX_CARGOS; i++) {
-        s->cargos[i].id = -1;
-    }
-
-    /* 根据目标货架分配到对应传送带:
-       Shelf0,2 -> Conv0 (左侧分支), Shelf1,3 -> Conv1 (右侧分支) */
-    for (i = 0; i < cargo_to_create; i++) {
-        int target = s->cargos[i].target_shelf_id;
-        int belt = (target == 0 || target == 2) ? 0 : 1;
-        Conveyor *c = &s->conveyors[belt];
-        if (c->cargo_cnt < c->capacity) {
-            s->cargos[i].state = CS_ON_CONVEYOR;
-            s->cargos[i].location_id = belt;
-            s->cargos[i].t_create = 0;
-            c->cargo_ids[c->cargo_cnt++] = i;
-        }
+    /* 标记多余槽无效 */
+    for (i = to_create; i < MAX_ITEMS; i++) {
+        s->items[i].id = -1;
     }
 
-    printf("仿真初始化完成: %d 货物, %d AGV, %d 传送带, %d 货架\n\n",
-           s->cargo_cnt, s->agv_cnt, s->conveyor_cnt, s->shelf_cnt);
+    /* 货物由conveyor_step按目标货架自动生成到对应传送带 */
+    stats_init(s);
+
+    printf("仿真初始化完成: %d 货物, %d AGV, %d 传送带, %d 货架, %d 交接区\n\n",
+           s->items_total, s->agv_cnt, s->conveyor_cnt, s->shelf_cnt, s->tzone_cnt);
 }
 
-/*
- * 主仿真循环
- */
 void sim_run(SimState *s) {
-    printf("========== 仿真开始 ==========\n\n");
+    printf("========== 仿真开始 (终端模式) ==========\n\n");
 
-    while (s->running && s->time < s->max_time) {
+    while (s->running && s->time < MAX_TIME) {
         s->time += 1.0;
 
-        /* 1. 传送带步骤 */
+        /* 1. 传送带 */
         int i;
-        for (i = 0; i < s->conveyor_cnt; i++) {
+        for (i = 0; i < s->conveyor_cnt; i++)
             conveyor_step(s, i);
-            if (!s->running) break;
-        }
-        if (!s->running) break;
 
         /* 2. AGV调度 */
-        agv_dispatch(s);
+        scheduler_dispatch_all(s);
+
+        /* 2.5 初始化全局预约表 */
+        pathfinding_resv_clear();
+        for (i = 0; i < s->agv_cnt; i++) {
+            AGV *agv = &s->agvs[i];
+            int has_active = (agv->traj_len > 0 && agv->traj_idx < agv->traj_len);
+            if (has_active) {
+                /* 有未完成轨迹: 加入预约表 */
+                pathfinding_resv_add_trajectory(
+                    &agv->trajectory[agv->traj_idx],
+                    agv->traj_len - agv->traj_idx);
+            } else {
+                /* 无轨迹(静止/等待): 生成停留预约 */
+                TrajectoryPoint stay[200];
+                int t;
+                for (t = 0; t < 200; t++) {
+                    stay[t].x = agv->pos.x;
+                    stay[t].y = agv->pos.y;
+                    stay[t].t = agv->cur_t + 1 + t;
+                }
+                pathfinding_resv_add_trajectory(stay, 200);
+            }
+        }
+
+        /* 2.6 检查活跃轨迹的终点是否与静止AGV冲突 */
+        for (i = 0; i < s->agv_cnt; i++) {
+            AGV *agv = &s->agvs[i];
+            if (agv->traj_len == 0 || agv->traj_idx >= agv->traj_len) continue;
+            TrajectoryPoint endpt = agv->trajectory[agv->traj_len - 1];
+            int j;
+            for (j = 0; j < s->agv_cnt; j++) {
+                if (i == j) continue;
+                AGV *other = &s->agvs[j];
+                int other_static = !(other->traj_len > 0 && other->traj_idx < other->traj_len);
+                if (other_static && other->pos.x == endpt.x && other->pos.y == endpt.y) {
+                    agv->traj_len = 0;
+                    agv->traj_idx = 0;
+                    break;
+                }
+            }
+        }
+
+        /* 2.7 检查两两活跃轨迹终点是否冲突 */
+        for (i = 0; i < s->agv_cnt; i++) {
+            AGV *a = &s->agvs[i];
+            if (a->traj_len == 0 || a->traj_idx >= a->traj_len) continue;
+            TrajectoryPoint ea = a->trajectory[a->traj_len - 1];
+            int j;
+            for (j = i + 1; j < s->agv_cnt; j++) {
+                AGV *b = &s->agvs[j];
+                if (b->traj_len == 0 || b->traj_idx >= b->traj_len) continue;
+                TrajectoryPoint eb = b->trajectory[b->traj_len - 1];
+                if (ea.x == eb.x && ea.y == eb.y &&
+                    abs(ea.t - eb.t) <= 15) {
+                    /* 两个AGV目标格相同且到达时间接近, 让后到的重规划 */
+                    if (ea.t >= eb.t)
+                        a->traj_len = 0, a->traj_idx = 0;
+                    else
+                        b->traj_len = 0, b->traj_idx = 0;
+                }
+            }
+        }
 
         /* 3. AGV移动 */
-        for (i = 0; i < s->agv_cnt; i++) {
+        for (i = 0; i < s->agv_cnt; i++)
             agv_step(s, i);
-            if (!s->running) break;
-        }
-        if (!s->running) break;
 
-        /* 4. 机器人步骤 */
-        for (i = 0; i < s->robot_cnt; i++) {
+        /* 4. 机器人 */
+        for (i = 0; i < s->robot_cnt; i++)
             robot_step(s, i);
-            if (!s->running) break;
-        }
-        if (!s->running) break;
 
-        /* 5. 约束校验(每10 tick做一次,节省开销) */
+        /* 5. 碎片整理 */
+        defrag_tick(s);
+
+        /* 6. 约束校验 */
         if ((int)s->time % 10 == 0) {
             constraint_check_all(s);
             if (!s->running) break;
         }
 
-        /* 调试: 前100 tick每10 tick输出详细状态 */
+        /* 7. 得分更新 */
+        stats_update(s);
+
+        /* 调试输出 */
         if ((int)s->time <= 100 && (int)s->time % 10 == 0) {
-            int n_init=0,n_conv=0,n_buf=0,n_agv=0,n_xfer=0,n_shelf=0;
-            int ci;
-            for (ci=0;ci<s->cargo_cnt;ci++) {
-                switch(s->cargos[ci].state) {
-                    case CS_INIT: n_init++; break;
-                    case CS_ON_CONVEYOR: n_conv++; break;
-                    case CS_IN_BUFFER: n_buf++; break;
-                    case CS_ON_AGV: n_agv++; break;
-                    case CS_AT_TRANSFER: n_xfer++; break;
-                    case CS_ON_SHELF: n_shelf++; break;
-                }
-            }
-            printf("  T%.0f: sh=%d | i=%d c=%d b=%d a=%d x=%d s=%d | ",
-                   s->time, s->cargo_shelved, n_init,n_conv,n_buf,n_agv,n_xfer,n_shelf);
-            for (ci=0;ci<s->agv_cnt;ci++) {
-                AGV *a = &s->agvs[ci];
+            printf("  T%.0f: 已上架=%d/%d | AGV: ", s->time, s->items_shelved, s->items_total);
+            for (i = 0; i < s->agv_cnt; i++) {
+                AGV *a = &s->agvs[i];
                 const char *st = "IDL";
-                if (a->state==AGV_TO_BUFFER) st="->B";
-                else if (a->state==AGV_WAIT_BUFFER) st="wB";
-                else if (a->state==AGV_LOADING) st="LOD";
-                else if (a->state==AGV_TO_TRANSFER) st="->T";
-                else if (a->state==AGV_WAIT_TRANSFER) st="wT";
-                else if (a->state==AGV_UNLOADING) st="ULD";
-                else if (a->state==AGV_BLOCKED) st="BLK";
-                printf("AGV%d(%d,%s,c%d) ", ci, a->cur_node, st, a->cargo_cnt);
+                if (a->status == AGV_MOVING_TO_BUFFER) st = "->B";
+                else if (a->status == AGV_MOVING_TO_TRANSFER) st = "->T";
+                else if (a->status == AGV_LOADING) st = "LD";
+                else if (a->status == AGV_UNLOADING) st = "UD";
+                else if (a->status == AGV_WAITING) st = "WT";
+                else if (a->status == AGV_RETURNING) st = "RT";
+                printf("AGV%d(%d,%d,%s,c%d) ", i, a->pos.x, a->pos.y, st, a->item_cnt);
             }
-            int bf_free=0;
-            for (ci=0;ci<s->buffer_cnt;ci++) bf_free += s->buffers[ci].capacity - s->buffers[ci].cargo_cnt;
-            int tp_free=0;
-            for (ci=0;ci<s->tp_cnt;ci++) tp_free += s->tps[ci].capacity - s->tps[ci].cargo_cnt;
-            printf("bf=%d tp=%d | r0[%d]=", bf_free, tp_free, s->robots[0].state);
-            for (ci=0;ci<s->robots[0].cargo_cnt;ci++) printf("%d,", s->robots[0].cargo_ids[ci]);
-            printf(" r1[%d]=", s->robots[1].state);
-            for (ci=0;ci<s->robots[1].cargo_cnt;ci++) printf("%d,", s->robots[1].cargo_ids[ci]);
-            printf(" | TP0:");
-            for (ci=0;ci<s->tps[0].cargo_cnt;ci++) printf("%d(s%d,v%d),", s->tps[0].cargo_ids[ci],
-                s->cargos[s->tps[0].cargo_ids[ci]].target_shelf_id,
-                s->cargos[s->tps[0].cargo_ids[ci]].volume);
-            printf(" TP1:");
-            for (ci=0;ci<s->tps[1].cargo_cnt;ci++) printf("%d(s%d,v%d),", s->tps[1].cargo_ids[ci],
-                s->cargos[s->tps[1].cargo_ids[ci]].target_shelf_id,
-                s->cargos[s->tps[1].cargo_ids[ci]].volume);
             printf("\n");
         }
 
-        /* 终止条件: 所有货物已上架 */
-        if (s->cargo_shelved >= s->cargo_total) {
+        /* 终止条件 */
+        if (s->items_shelved >= s->items_total) {
             s->running = 0;
         }
 
-        /* 如果所有AGV空闲, 所有传送带空且缓冲区空, 仍有未上架货物 -> 死锁 */
-        int all_idle = 1;
-        for (i = 0; i < s->agv_cnt; i++) {
-            if (s->agvs[i].busy) { all_idle = 0; break; }
-        }
-        if (all_idle && s->cargo_shelved < s->cargo_total) {
-            /* 检查是否还有货物在流程中 */
-            int in_flow = 0;
-            int ci;
-            for (ci = 0; ci < s->cargo_cnt; ci++) {
-                if (s->cargos[ci].state != CS_ON_SHELF &&
-                    s->cargos[ci].state != CS_INIT) {
-                    in_flow++;
-                }
-            }
-            if (in_flow == 0 && s->cargo_shelved < s->cargo_total) {
-                /* 还有未进入流程的货物 -> 可能是生成不足, 继续 */
-                /* 但检查传送带, 缓冲区等地方 */
-                int buf_empty = 1;
-                for (i = 0; i < s->buffer_cnt; i++) {
-                    if (s->buffers[i].cargo_cnt > 0) buf_empty = 0;
-                }
-                int tp_empty = 1;
-                for (i = 0; i < s->tp_cnt; i++) {
-                    if (s->tps[i].cargo_cnt > 0) tp_empty = 0;
-                }
-                if (buf_empty && tp_empty) {
-                    int conv_empty = 1;
-                    for (i = 0; i < s->conveyor_cnt; i++) {
-                        if (s->conveyors[i].cargo_cnt > 0) conv_empty = 0;
-                    }
-                    if (conv_empty) {
-                        /* 系统死锁或所有在途货物无法继续 */
-                        if (s->time > 50) break; /* 给足够时间 */
-                    }
-                }
-            }
+        /* 死锁检测: 所有AGV空闲 + 全系统无在途货物 */
+        if (s->items_shelved < s->items_total && s->time > 200) {
+            int all_idle = 1, all_empty = 1;
+            for (i = 0; i < s->agv_cnt; i++)
+                if (s->agvs[i].busy) all_idle = 0;
+            for (i = 0; i < s->buffer_cnt; i++)
+                if (s->buffers[i].item_cnt > 0) all_empty = 0;
+            for (i = 0; i < s->tzone_cnt; i++)
+                if (s->tzones[i].item_cnt > 0) all_empty = 0;
+            for (i = 0; i < s->conveyor_cnt; i++)
+                if (s->conveyors[i].item_cnt > 0) all_empty = 0;
+            for (i = 0; i < s->agv_cnt; i++)
+                if (s->agvs[i].item_cnt > 0) all_empty = 0;
+            for (i = 0; i < s->robot_cnt; i++)
+                if (s->robots[i].item_cnt > 0) all_empty = 0;
+            /* 还有未生成的货物(仍在传送带上排队) */
+            int unspawned = 0;
+            for (i = 0; i < s->item_cnt; i++)
+                if (s->items[i].state == ITEM_INIT) unspawned = 1;
+            if (all_idle && all_empty && !unspawned) break;
         }
     }
 
-    /* 最终约束校验 */
     constraint_check_all(s);
+    stats_print(s);
+}
 
-    printf("\n========== 仿真结束 ==========\n");
-    printf("结束时间: %.0f ticks\n", s->time);
-    printf("上架: %d / %d\n", s->cargo_shelved, s->cargo_total);
-    if (!s->running && s->violations > 0) {
-        printf("终止原因: %s\n", s->violation_msg[0] ?
-               s->violation_msg : "约束违规");
-    } else if (s->time >= s->max_time) {
-        printf("终止原因: 达到最大仿真时间\n");
-    } else if (s->cargo_shelved >= s->cargo_total) {
-        printf("终止原因: 全部货物已上架\n");
+void sim_run_with_server(SimState *s, int ws_port) {
+    server_start(s, ws_port);
+    printf("========== 仿真开始 (服务器模式: ws://localhost:%d/ws) ==========\n\n", ws_port);
+
+    while (s->running && s->time < MAX_TIME) {
+        s->time += 1.0;
+
+        int i;
+        for (i = 0; i < s->conveyor_cnt; i++)
+            conveyor_step(s, i);
+        scheduler_dispatch_all(s);
+
+        /* 初始化全局预约表 */
+        pathfinding_resv_clear();
+        for (i = 0; i < s->agv_cnt; i++) {
+            AGV *agv = &s->agvs[i];
+            int has_active = (agv->traj_len > 0 && agv->traj_idx < agv->traj_len);
+            if (has_active) {
+                pathfinding_resv_add_trajectory(
+                    &agv->trajectory[agv->traj_idx],
+                    agv->traj_len - agv->traj_idx);
+            } else {
+                TrajectoryPoint stay[30];
+                int t;
+                for (t = 0; t < 30; t++) {
+                    stay[t].x = agv->pos.x;
+                    stay[t].y = agv->pos.y;
+                    stay[t].t = agv->cur_t + 1 + t;
+                }
+                pathfinding_resv_add_trajectory(stay, 200);
+            }
+        }
+
+        /* 检查活跃轨迹终点是否与静止AGV冲突 */
+        for (i = 0; i < s->agv_cnt; i++) {
+            AGV *agv = &s->agvs[i];
+            if (agv->traj_len == 0 || agv->traj_idx >= agv->traj_len) continue;
+            TrajectoryPoint endpt = agv->trajectory[agv->traj_len - 1];
+            int j;
+            for (j = 0; j < s->agv_cnt; j++) {
+                if (i == j) continue;
+                AGV *other = &s->agvs[j];
+                int other_static = !(other->traj_len > 0 && other->traj_idx < other->traj_len);
+                if (other_static && other->pos.x == endpt.x && other->pos.y == endpt.y) {
+                    agv->traj_len = 0;
+                    agv->traj_idx = 0;
+                    break;
+                }
+            }
+        }
+
+        /* 检查两两活跃轨迹终点是否冲突 */
+        for (i = 0; i < s->agv_cnt; i++) {
+            AGV *a = &s->agvs[i];
+            if (a->traj_len == 0 || a->traj_idx >= a->traj_len) continue;
+            TrajectoryPoint ea = a->trajectory[a->traj_len - 1];
+            int j;
+            for (j = i + 1; j < s->agv_cnt; j++) {
+                AGV *b = &s->agvs[j];
+                if (b->traj_len == 0 || b->traj_idx >= b->traj_len) continue;
+                TrajectoryPoint eb = b->trajectory[b->traj_len - 1];
+                if (ea.x == eb.x && ea.y == eb.y &&
+                    abs(ea.t - eb.t) <= 15) {
+                    if (ea.t >= eb.t)
+                        a->traj_len = 0, a->traj_idx = 0;
+                    else
+                        b->traj_len = 0, b->traj_idx = 0;
+                }
+            }
+        }
+
+        for (i = 0; i < s->agv_cnt; i++)
+            agv_step(s, i);
+        for (i = 0; i < s->robot_cnt; i++)
+            robot_step(s, i);
+        defrag_tick(s);
+
+        if ((int)s->time % 10 == 0) {
+            constraint_check_all(s);
+            if (!s->running) break;
+        }
+
+        stats_update(s);
+
+        /* 每2 tick推送一帧(约30fps有效帧) */
+        if ((int)s->time % 2 == 0) {
+            server_push_frame(s);
+        }
+
+        if ((int)s->time <= 100 && (int)s->time % 20 == 0) {
+            printf("  T%.0f: 已上架=%d/%d 得分=%.1f\n",
+                   s->time, s->items_shelved, s->items_total, s->score);
+        }
+
+        if (s->items_shelved >= s->items_total) {
+            s->running = 0;
+        }
     }
-    printf("\n");
+
+    /* 推送最终帧 */
+    server_push_frame(s);
+    stats_print(s);
+
+#ifdef _WIN32
+    Sleep(2000); /* 让客户端收到最后帧 */
+#else
+    sleep(2);
+#endif
+    server_stop();
 }
