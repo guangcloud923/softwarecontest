@@ -1,0 +1,53 @@
+{
+  "map": {
+    "width": 16,
+    "height": 14,
+    "description": "16x14 grid, 0-indexed"
+  },
+  "conveyors": {
+    "C1": {"x": 3, "y": 0, "output_buffer": "B1"},
+    "C2": {"x": 12, "y": 0, "output_buffer": "B2"}
+  },
+  "buffers": {
+    "B1": {"x": 3, "y": 2, "conveyor_id": "C1", "capacity": 6},
+    "B2": {"x": 12, "y": 2, "conveyor_id": "C2", "capacity": 6}
+  },
+  "transfer_zones": {
+    "T1": {"x": 1, "y": 8, "shelf_ids": ["S1"], "robot_id": 0, "capacity_vol": 1.0},
+    "T2": {"x": 5, "y": 8, "shelf_ids": ["S2"], "robot_id": 0, "capacity_vol": 1.0},
+    "T3": {"x": 10, "y": 8, "shelf_ids": ["S3"], "robot_id": 1, "capacity_vol": 1.0},
+    "T4": {"x": 14, "y": 8, "shelf_ids": ["S4"], "robot_id": 1, "capacity_vol": 1.0}
+  },
+  "shelves": {
+    "S1": {"x": 1, "y": 10, "robot_id": 0, "transfer_zone": "T1"},
+    "S2": {"x": 5, "y": 10, "robot_id": 0, "transfer_zone": "T2"},
+    "S3": {"x": 10, "y": 10, "robot_id": 1, "transfer_zone": "T3"},
+    "S4": {"x": 14, "y": 10, "robot_id": 1, "transfer_zone": "T4"}
+  },
+  "agv_parks": {
+    "P1": {"x": 1, "y": 0},
+    "P2": {"x": 14, "y": 0},
+    "P3": {"x": 1, "y": 6},
+    "P4": {"x": 14, "y": 6}
+  },
+  "pickup_map": {
+    "C1": {"x": 3, "y": 2},
+    "C2": {"x": 12, "y": 2}
+  },
+  "drop_map": {
+    "S1": {"x": 1, "y": 8},
+    "S2": {"x": 5, "y": 8},
+    "S3": {"x": 10, "y": 8},
+    "S4": {"x": 14, "y": 8}
+  },
+  "shelf_to_transfer": {
+    "S1": "T1",
+    "S2": "T2",
+    "S3": "T3",
+    "S4": "T4"
+  },
+  "robot_zones": {
+    "0": {"shelves": ["S1", "S2"], "transfer_zones": ["T1", "T2"]},
+    "1": {"shelves": ["S3", "S4"], "transfer_zones": ["T3", "T4"]}
+  }
+}

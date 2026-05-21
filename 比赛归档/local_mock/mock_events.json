@@ -1,0 +1,96 @@
+[
+  {
+    "event": "EVT_CARGO_AVAIL",
+    "payload": {
+      "cargo": {
+        "id": "CARGO_001",
+        "volume": 0.25,
+        "target_shelf": "S1"
+      },
+      "conveyor_id": "C1"
+    }
+  },
+  {
+    "event": "EVT_AGV_IDLE",
+    "payload": {
+      "agv_id": "AGV_1",
+      "position": {"x": 0, "y": 0}
+    }
+  },
+  {
+    "event": "EVT_CARGO_AVAIL",
+    "payload": {
+      "cargo": {
+        "id": "CARGO_002",
+        "volume": 0.5,
+        "target_shelf": "S3"
+      },
+      "conveyor_id": "C2"
+    }
+  },
+  {
+    "event": "EVT_AGV_IDLE",
+    "payload": {
+      "agv_id": "AGV_2",
+      "position": {"x": 14, "y": 0}
+    }
+  },
+  {
+    "event": "EVT_CARGO_AVAIL",
+    "payload": {
+      "cargo": {
+        "id": "CARGO_003",
+        "volume": 1.0,
+        "target_shelf": "S2"
+      },
+      "conveyor_id": "C1"
+    }
+  },
+  {
+    "event": "EVT_AGV_IDLE",
+    "payload": {
+      "agv_id": "AGV_3",
+      "position": {"x": 1, "y": 6}
+    }
+  },
+  {
+    "event": "REQ_PATH",
+    "payload": {
+      "from": {"x": 0, "y": 0},
+      "to": {"x": 5, "y": 2},
+      "agv_id": "AGV_1"
+    }
+  },
+  {
+    "event": "REQ_PATH",
+    "payload": {
+      "from": {"x": 14, "y": 0},
+      "to": {"x": 10, "y": 8},
+      "agv_id": "AGV_2"
+    }
+  },
+  {
+    "event": "REQ_MOVE_PROPOSED",
+    "payload": {
+      "agv_id": "AGV_1",
+      "x": 1,
+      "y": 0
+    }
+  },
+  {
+    "event": "REQ_MOVE_PROPOSED",
+    "payload": {
+      "agv_id": "AGV_2",
+      "x": 13,
+      "y": 0
+    }
+  },
+  {
+    "event": "REQ_MOVE_PROPOSED",
+    "payload": {
+      "agv_id": "AGV_1",
+      "x": 2,
+      "y": 0
+    }
+  }
+]

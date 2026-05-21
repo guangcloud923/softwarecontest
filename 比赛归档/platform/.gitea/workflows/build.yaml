@@ -1,0 +1,25 @@
+name: Build for aarch64
+
+on:
+  workflow_dispatch:
+
+jobs:
+  build:
+    runs-on: ubuntu-latest
+
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Build
+        run: |
+          mkdir -p dist
+
+          g++ src/safety_guard_618631.cpp -std=c++17 -lm -o dist/safety_guard_618631.elf
+
+          cp src/path_plan_618631.js dist/path_plan_618631.js
+
+          python3 -m py_compile src/scheduler_global_618631.py
+          cp src/scheduler_global_618631.py dist/scheduler_global_618631.py
+
+          find dist -type f -print
